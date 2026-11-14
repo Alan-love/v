@@ -1,0 +1,310 @@
+// Brotli compression/decompression helpers using the system libbrotli runtime.
+module brotli
+
+import os
+import dl
+
+// Keep the sanitizer helper in a separate native object so its symbol survives
+// module-cache splitting. The C compiler owns MemorySanitizer feature detection.
+#define V_BROTLI_MSAN_DATA const volatile void
+#flag @VMODROOT/vlib/compress/brotli/brotli_msan.c
+
+@[c_extern]
+fn C.v_brotli_msan_unpoison(data &C.V_BROTLI_MSAN_DATA, len uint)
+
+fn unpoison_output(data voidptr, len uint) {
+	$if !native {
+		if len > 0 {
+			// The cast adds the sanitizer interface's C pointer qualifiers.
+			C.v_brotli_msan_unpoison(unsafe { &C.V_BROTLI_MSAN_DATA(data) }, len)
+		}
+	}
+}
+
+const min_quality = 0
+const max_quality = 11
+const min_lgwin = 10
+const max_lgwin = 24
+const decode_chunk_size = 32 * 1024
+
+const decoder_result_error = 0
+const decoder_result_success = 1
+const decoder_result_needs_more_input = 2
+const decoder_result_needs_more_output = 3
+
+type FNEncoderMaxCompressedSize = fn (uint) uint
+
+type FNEncoderCompress = fn (int, int, int, uint, voidptr, &uint, voidptr) int
+
+type FNDecoderCreateInstance = fn (voidptr, voidptr, voidptr) voidptr
+
+type FNDecoderDestroyInstance = fn (voidptr)
+
+type FNDecoderDecompressStream = fn (voidptr, &uint, &&u8, &uint, &&u8, &uint) int
+
+type FNDecoderGetErrorCode = fn (voidptr) int
+
+type FNDecoderErrorString = fn (int) charptr
+
+// DecompressCallback receives decoded chunks and returns the chunk length to continue or 0 to stop.
+pub type DecompressCallback = fn (chunk []u8, userdata voidptr) int
+
+struct DecompressedBuffer {
+mut:
+	data []u8
+}
+
+fn append_decompressed_chunk(chunk []u8, userdata voidptr) int {
+	mut buffer := unsafe { &DecompressedBuffer(userdata) }
+	buffer.data << chunk
+	return chunk.len
+}
+
+// Mode tunes the Brotli encoder for generic, text, or font data.
+pub enum Mode {
+	generic = 0
+	text    = 1
+	font    = 2
+}
+
+// CompressParams controls Brotli compression.
+@[params]
+pub struct CompressParams {
+pub:
+	quality int  = 11
+	lgwin   int  = 22
+	mode    Mode = .generic
+}
+
+// DecompressParams controls Brotli decompression.
+@[params]
+pub struct DecompressParams {}
+
+fn open_library_name(name string) voidptr {
+	return dl.open(name, dl.rtld_lazy)
+}
+
+fn open_env_library(env_name string) voidptr {
+	path := os.getenv_opt(env_name) or { return 0 }
+	if path == '' {
+		return 0
+	}
+	return open_library_name(path)
+}
+
+fn open_encoder_library() !voidptr {
+	env_handle := open_env_library('V_BROTLI_ENC_LIB')
+	if env_handle != 0 {
+		return env_handle
+	}
+	$if windows {
+		for name in ['brotlienc.dll', 'libbrotlienc.dll'] {
+			handle := open_library_name(name)
+			if handle != 0 {
+				return handle
+			}
+		}
+	} $else $if macos {
+		for name in ['libbrotlienc.dylib', '/opt/homebrew/lib/libbrotlienc.dylib',
+			'/usr/local/lib/libbrotlienc.dylib'] {
+			handle := open_library_name(name)
+			if handle != 0 {
+				return handle
+			}
+		}
+	} $else {
+		for name in ['libbrotlienc.so', 'libbrotlienc.so.1'] {
+			handle := open_library_name(name)
+			if handle != 0 {
+				return handle
+			}
+		}
+	}
+	return error('brotli: could not load encoder library')
+}
+
+fn open_decoder_library() !voidptr {
+	env_handle := open_env_library('V_BROTLI_DEC_LIB')
+	if env_handle != 0 {
+		return env_handle
+	}
+	$if windows {
+		for name in ['brotlidec.dll', 'libbrotlidec.dll'] {
+			handle := open_library_name(name)
+			if handle != 0 {
+				return handle
+			}
+		}
+	} $else $if macos {
+		for name in ['libbrotlidec.dylib', '/opt/homebrew/lib/libbrotlidec.dylib',
+			'/usr/local/lib/libbrotlidec.dylib'] {
+			handle := open_library_name(name)
+			if handle != 0 {
+				return handle
+			}
+		}
+	} $else {
+		for name in ['libbrotlidec.so', 'libbrotlidec.so.1'] {
+			handle := open_library_name(name)
+			if handle != 0 {
+				return handle
+			}
+		}
+	}
+	return error('brotli: could not load decoder library')
+}
+
+fn close_library(handle voidptr) {
+	dl.close(handle)
+}
+
+fn library_symbol(handle voidptr, name string, kind string) !voidptr {
+	sym := dl.sym(handle, name)
+	if sym == 0 {
+		return error('brotli: could not load ${kind} symbol ${name}')
+	}
+	return sym
+}
+
+// is_available reports whether both Brotli encoder and decoder libraries can be loaded.
+pub fn is_available() bool {
+	enc := open_encoder_library() or { return false }
+	defer {
+		close_library(enc)
+	}
+	dec := open_decoder_library() or { return false }
+	defer {
+		close_library(dec)
+	}
+	library_symbol(enc, 'BrotliEncoderCompress', 'encoder') or { return false }
+	library_symbol(dec, 'BrotliDecoderDecompressStream', 'decoder') or { return false }
+	return true
+}
+
+fn validate_compress_params(params CompressParams) ! {
+	if params.quality < min_quality || params.quality > max_quality {
+		return error('brotli: quality must be between ${min_quality} and ${max_quality}')
+	}
+	if params.lgwin < min_lgwin || params.lgwin > max_lgwin {
+		return error('brotli: lgwin must be between ${min_lgwin} and ${max_lgwin}')
+	}
+}
+
+// compress compresses data as a Brotli stream and returns the compressed bytes.
+pub fn compress(data []u8, params CompressParams) ![]u8 {
+	validate_compress_params(params)!
+	enc := open_encoder_library()!
+	defer {
+		close_library(enc)
+	}
+	max_compressed_size := FNEncoderMaxCompressedSize(library_symbol(enc,
+		'BrotliEncoderMaxCompressedSize', 'encoder')!)
+	encoder_compress := FNEncoderCompress(library_symbol(enc, 'BrotliEncoderCompress', 'encoder')!)
+	dst_capacity := max_compressed_size(uint(data.len))
+	if dst_capacity == 0 {
+		return error('brotli: input is too large')
+	}
+	mut dst := []u8{len: int(dst_capacity)}
+	mut keep_dst := false
+	defer {
+		if !keep_dst {
+			unsafe { dst.free() }
+		}
+	}
+	mut encoded_size := dst_capacity
+	ok := encoder_compress(params.quality, params.lgwin, int(params.mode), uint(data.len),
+		data.data, &encoded_size, dst.data)
+	if ok == 0 {
+		return error('brotli: compression failed')
+	}
+	unpoison_output(dst.data, encoded_size)
+	keep_dst = true
+	return dst[..int(encoded_size)]
+}
+
+// decompress decompresses a Brotli stream and returns the decompressed bytes.
+pub fn decompress(data []u8, _ DecompressParams) ![]u8 {
+	mut buffer := DecompressedBuffer{}
+	mut keep_data := false
+	defer {
+		if !keep_data {
+			unsafe { buffer.data.free() }
+		}
+	}
+	decompress_with_callback(data, append_decompressed_chunk, voidptr(&buffer))!
+	keep_data = true
+	return buffer.data
+}
+
+// decompress_with_callback decompresses a Brotli stream and delivers output chunks to `cb`.
+// Returning 0 from `cb` stops decoding before the remaining input is validated.
+pub fn decompress_with_callback(data []u8, cb DecompressCallback, userdata voidptr) !int {
+	dec := open_decoder_library()!
+	defer {
+		close_library(dec)
+	}
+	decoder_create := FNDecoderCreateInstance(library_symbol(dec, 'BrotliDecoderCreateInstance',
+		'decoder')!)
+	decoder_destroy := FNDecoderDestroyInstance(library_symbol(dec, 'BrotliDecoderDestroyInstance',
+		'decoder')!)
+	decoder_stream := FNDecoderDecompressStream(library_symbol(dec,
+		'BrotliDecoderDecompressStream', 'decoder')!)
+	decoder_get_error := FNDecoderGetErrorCode(library_symbol(dec, 'BrotliDecoderGetErrorCode',
+		'decoder')!)
+	decoder_error_string := FNDecoderErrorString(library_symbol(dec, 'BrotliDecoderErrorString',
+		'decoder')!)
+	state := decoder_create(unsafe { nil }, unsafe { nil }, unsafe { nil })
+	if state == 0 {
+		return error('brotli: could not create decoder state')
+	}
+	defer {
+		decoder_destroy(state)
+	}
+	mut chunk := []u8{len: decode_chunk_size}
+	defer {
+		unsafe { chunk.free() }
+	}
+	mut available_in := uint(data.len)
+	mut next_in := unsafe { &u8(data.data) }
+	mut delivered := 0
+	for {
+		mut available_out := uint(chunk.len)
+		mut next_out := unsafe { &u8(chunk.data) }
+		mut total_out := uint(0)
+		result := decoder_stream(state, &available_in, &next_in, &available_out, &next_out,
+			&total_out)
+		produced := chunk.len - int(available_out)
+		if produced > 0 {
+			unpoison_output(chunk.data, uint(produced))
+			if cb(chunk[..produced], userdata) != produced {
+				return delivered
+			}
+			delivered += produced
+		}
+		match result {
+			decoder_result_success {
+				if available_in != 0 {
+					return error('brotli: trailing data after stream')
+				}
+				return delivered
+			}
+			decoder_result_needs_more_output {
+				if produced == 0 {
+					return error('brotli: decoder needs more output without producing data')
+				}
+			}
+			decoder_result_needs_more_input {
+				return error('brotli: unexpected end of input')
+			}
+			decoder_result_error {
+				code := decoder_get_error(state)
+				msg := unsafe { tos_clone(&u8(decoder_error_string(code))) }
+				return error('brotli: ${msg}')
+			}
+			else {
+				return error('brotli: unexpected decoder result ${result}')
+			}
+		}
+	}
+	return error('brotli: decoder stopped unexpectedly')
+}

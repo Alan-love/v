@@ -1,0 +1,32 @@
+vlib/v/checker/tests/with_check_option/v_import_const.vv:1:8: warning: module 'def (abc.def)' is imported but never used. Use `import def (abc.def) as _`, to silence this warning, or just remove the unused import line
+    1 | import abc.def { const, global }
+      |        ~~~~~~~
+    2 | import xyz.qwe
+    3 |
+vlib/v/checker/tests/with_check_option/v_import_const.vv:2:8: warning: module 'qwe (xyz.qwe)' is imported but never used. Use `import qwe (xyz.qwe) as _`, to silence this warning, or just remove the unused import line
+    1 | import abc.def { const, global }
+    2 | import xyz.qwe
+      |        ~~~~~~~
+    3 |
+    4 | fn abc() {
+vlib/v/checker/tests/with_check_option/v_import_const.vv:1:1: builder error: cannot import module "abc.def" (not found)
+    1 | import abc.def { const, global }
+      | ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    2 | import xyz.qwe
+    3 |
+vlib/v/checker/tests/with_check_option/v_import_const.vv:1:18: error: module `abc.def` has no constant or function `const`
+    1 | import abc.def { const, global }
+      |                  ~~~~~
+    2 | import xyz.qwe
+    3 |
+vlib/v/checker/tests/with_check_option/v_import_const.vv:1:25: error: module `abc.def` has no constant or function `global`
+    1 | import abc.def { const, global }
+      |                         ~~~~~~
+    2 | import xyz.qwe
+    3 |
+vlib/v/checker/tests/with_check_option/v_import_const.vv:2:1: builder error: cannot import module "xyz.qwe" (not found)
+    1 | import abc.def { const, global }
+    2 | import xyz.qwe
+      | ~~~~~~~~~~~~~~
+    3 |
+    4 | fn abc() {

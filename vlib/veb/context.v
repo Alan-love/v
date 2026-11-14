@@ -1,0 +1,853 @@
+module veb
+
+import compress.gzip
+import compress.zstd
+import hash
+import net
+import net.http
+import os
+import time
+import json2 as json
+
+enum ContextReturnType {
+	normal
+	file
+}
+
+enum ContextTakeoverMode {
+	none
+	manual
+	reusable
+}
+
+pub enum RedirectType {
+	found              = int(http.Status.found)
+	moved_permanently  = int(http.Status.moved_permanently)
+	see_other          = int(http.Status.see_other)
+	temporary_redirect = int(http.Status.temporary_redirect)
+	permanent_redirect = int(http.Status.permanent_redirect)
+}
+
+// The Context struct represents the Context which holds the HTTP request and response.
+// It has fields for the query, form, files and methods for handling the request and response
+@[heap]
+pub struct Context {
+mut:
+	// veb will try to infer the content type base on file extension,
+	// and if `content_type` is not empty the `Content-Type` header will always be
+	// set to this value
+	content_type string
+	// done is set to true when a response can be sent over `conn`
+	done bool
+	// Set only on the writer snapshot; shared GC bodies must not be freed manually.
+	shared_response_body bool
+	// If the `Connection: close` header is present the connection should always be closed
+	client_wants_to_close bool
+	// Configuration for static file compression (set by serve_if_static)
+	enable_static_gzip            bool
+	enable_static_zstd            bool
+	enable_static_compression     bool
+	static_compression_max_size   int
+	static_compression_mime_types []string
+	// controls whether veb should automatically send the response or whether the handler
+	// takes over response writing.
+	takeover_mode ContextTakeoverMode
+	return_file   string
+	// Keep the clone alive until handoff, so address reuse cannot fake ownership.
+	owned_response_body   &u8                = unsafe { nil }
+	custom_mime_types_ref &map[string]string = unsafe { nil }
+	// raw client file descriptor, used by the fasthttp backend to create a TcpConn
+	// on demand when takeover_conn() is called
+	client_fd int = -1
+	// already_compressed indicates that the response body is already compressed (zstd/gzip)
+	// and the compression middlewares should skip it
+	already_compressed bool
+	// throttle_leases are the handler slots throttle middleware took for this
+	// request. `handle_route` frees them however the request ends: 404s and
+	// requests a middleware refuses skip the after-middleware, so an
+	// after-middleware could not free them reliably.
+	throttle_leases []ThrottleLease
+	// Deferred response state, armed by `Context.after`: `deferred_cb` runs no
+	// sooner than `deferred_ms` milliseconds after the handler returns, with
+	// `deferred_arg`. `handle_request_and_route` spawns the timer thread once
+	// the handled context is preserved on the heap.
+	deferred     bool
+	deferred_ms  int
+	deferred_arg u64
+	deferred_cb  AfterCallback = unsafe { nil }
+	// trusted_proxies are the socket peer addresses whose forwarding headers
+	// `ip()` may believe. The framework copies this from a `trusted_proxies`
+	// field on the app struct into every request context; an app that does not
+	// declare one gets the empty list, so `ip()` answers the socket peer.
+	trusted_proxies []string
+	// access_log_start_ns is the monotonic clock reading (`time.sys_mono_now()`)
+	// the access-log middleware stamped when the request arrived, so its finish
+	// half can log the latency. Zero means unstamped.
+	access_log_start_ns i64
+pub:
+	// TODO: move this to `handle_request`
+	// time.ticks() from start of veb connection handle.
+	// You can use it to determine how much time is spent on your request.
+	page_gen_start i64
+pub mut:
+	// how the http response should be handled by veb's backend
+	return_type       ContextReturnType = .normal
+	req               http.Request @[skip]
+	custom_mime_types map[string]string
+	// TCP connection to client. Only for advanced usage!
+	conn &net.TcpConn = unsafe { nil }
+	// Map containing query params for the route.
+	// http://localhost:3000/index?q=vpm&order_by=desc => { 'q': 'vpm', 'order_by': 'desc' }
+	query map[string]string
+	// Multipart-form fields.
+	form map[string]string
+	// Files from multipart-form.
+	files map[string][]http.FileData
+	res   http.Response
+	// use form_error to pass errors from the context to your frontend
+	form_error string
+	// livereload_poll_interval_ms is not used: veb serves the livereload script
+	// before any user code runs, so it could never be set. With
+	// `-d veb_livereload_polling`, use `-d veb_livereload_poll_ms=<ms>` instead.
+	livereload_poll_interval_ms int = 250 @[deprecated: 'use `-d veb_livereload_poll_ms=<ms>`']
+}
+
+fn clone_response_writer_header(header http.Header) http.Header {
+	mut cloned := http.new_header()
+	mut seen := map[string]bool{}
+	for key in header.keys() {
+		if key in seen {
+			continue
+		}
+		seen[key] = true
+		for value in header.custom_values(key, exact: true) {
+			cloned.add_custom(key.clone(), value.clone()) or {}
+		}
+	}
+	return cloned
+}
+
+fn (mut ctx Context) preserve_for_response_writer(mut user_context Context) {
+	if !response_body_can_share_gc_buffer() {
+		ctx.copy_for_response_writer(user_context)
+		return
+	}
+	// The retained owner keeps this exact GC buffer alive during the handler.
+	// A direct body replacement therefore cannot match a recycled allocation.
+	share_body := user_context.owned_response_body != unsafe { nil }
+		&& user_context.owned_response_body == user_context.res.body.str
+	unsafe { *ctx = user_context }
+	if share_body {
+		ctx.shared_response_body = true
+	} else {
+		ctx.res.body = user_context.res.body.clone()
+		ctx.shared_response_body = false
+	}
+	// Only the response string and application aliases keep the body after handoff.
+	ctx.owned_response_body = unsafe { nil }
+	user_context.owned_response_body = unsafe { nil }
+	ctx.res.header = clone_response_writer_header(user_context.res.header)
+	ctx.res.status_msg = user_context.res.status_msg.clone()
+	ctx.res.http_version = user_context.res.http_version.clone()
+	ctx.req.header = clone_response_writer_header(user_context.req.header)
+	ctx.return_file = user_context.return_file.clone()
+}
+
+// Preserve the original copying contract outside ordinary Boehm GC builds.
+fn (mut ctx Context) copy_for_response_writer(user_context Context) {
+	unsafe { *ctx = user_context }
+	ctx.res.body = user_context.res.body.clone()
+	ctx.res.header = clone_response_writer_header(user_context.res.header)
+	ctx.res.status_msg = user_context.res.status_msg.clone()
+	ctx.res.http_version = user_context.res.http_version.clone()
+	ctx.req.header = clone_response_writer_header(user_context.req.header)
+	ctx.return_file = user_context.return_file.clone()
+	ctx.owned_response_body = unsafe { nil }
+	ctx.shared_response_body = false
+}
+
+fn response_body_can_share_gc_buffer() bool {
+	$if gcboehm ? {
+		$if prealloc {
+			return false
+		}
+		$if autofree ? {
+			return false
+		}
+		$if ownership ? {
+			return false
+		}
+		return true
+	} $else {
+		return false
+	}
+}
+
+fn (mut ctx Context) release_response_body() {
+	ctx.owned_response_body = unsafe { nil }
+	if ctx.res.body.len > 0 && !ctx.shared_response_body {
+		unsafe { ctx.res.body.free() }
+	}
+	ctx.res.body = ''
+	ctx.shared_response_body = false
+}
+
+// returns the request header data from the key
+pub fn (ctx &Context) get_header(key http.CommonHeader) ?string {
+	return ctx.req.header.get(key)
+}
+
+// returns the request header data from the key
+pub fn (ctx &Context) get_custom_header(key string) ?string {
+	return ctx.req.header.get_custom(key)
+}
+
+// set a header on the response object
+pub fn (mut ctx Context) set_header(key http.CommonHeader, value string) {
+	ctx.res.header.set(key, value)
+}
+
+// set a custom header on the response object
+pub fn (mut ctx Context) set_custom_header(key string, value string) ! {
+	ctx.res.header.set_custom(key, value)!
+}
+
+// send_response_to_client finalizes the response headers and sets Content-Type to `mimetype`
+// and the response body to `response`
+pub fn (mut ctx Context) send_response_to_client(mimetype string, response string) Result {
+	if ctx.done && ctx.takeover_mode == .none {
+		eprintln('[veb] a response cannot be sent twice over one connection')
+		return Result{}
+	}
+	// ctx.done is only set in this function, so in order to sent a response over the connection
+	// this value has to be set to true. Assuming the user doesn't use `ctx.conn` directly.
+	ctx.done = true
+	ctx.release_response_body()
+	$if veb_livereload ? {
+		if mimetype == 'text/html' {
+			ctx.res.body = response.replace('</html>',
+				livereload_script_tag(ctx.req.method.str()) + '\n</html>')
+		} else {
+			ctx.res.body = response.clone()
+		}
+	} $else {
+		ctx.res.body = response.clone()
+	}
+	if response_body_can_share_gc_buffer() { ctx.owned_response_body = ctx.res.body.str }
+	// Prefer explicit overrides from Context state or a pre-set response header.
+	mut custom_mimetype := ctx.content_type
+	if custom_mimetype.len == 0 {
+		custom_mimetype = ctx.res.header.get(.content_type) or { mimetype }
+	}
+	if custom_mimetype != '' {
+		ctx.res.header.set(.content_type, custom_mimetype)
+	}
+	if !ctx.res.header.contains(.content_length) && ctx.res.status_code != int(http.Status.not_modified) {
+		ctx.res.header.set(.content_length, ctx.res.body.len.str())
+	}
+	// send veb's closing headers
+	ctx.res.header.set(.server, 'veb')
+	if ctx.takeover_mode == .none && ctx.client_wants_to_close {
+		// Only sent the `Connection: close` header when the client wants to close
+		// the connection. This typically happens when the client only supports HTTP 1.0
+		ctx.res.header.set(.connection, 'close')
+	}
+	// set the http version
+	ctx.res.set_version(.v1_1)
+	if ctx.res.status_code == 0 {
+		ctx.res.set_status(.ok)
+	}
+	if ctx.takeover_mode != .none && ctx.conn != unsafe { nil } {
+		fast_send_resp(mut ctx.conn, ctx.res) or {}
+		ctx.release_response_body()
+	}
+	// result is send in `veb.v`, `handle_route`
+	return Result{}
+}
+
+// Response with payload and content-type `text/html`
+pub fn (mut ctx Context) html(s string) Result {
+	return ctx.send_response_to_client('text/html', s)
+}
+
+// Response with `s` as payload and content-type `text/plain`
+pub fn (mut ctx Context) text(s string) Result {
+	return ctx.send_response_to_client('text/plain', s)
+}
+
+fn (mut ctx Context) set_static_compression_config(enable_gzip bool, enable_zstd bool, enable_compression bool, max_size int, mime_types []string) {
+	ctx.enable_static_gzip = enable_gzip
+	ctx.enable_static_zstd = enable_zstd
+	ctx.enable_static_compression = enable_compression
+	ctx.static_compression_max_size = max_size
+	ctx.static_compression_mime_types = mime_types
+}
+
+// Response with json_s as payload and content-type `application/json`
+pub fn (mut ctx Context) json[T](j T) Result {
+	json_s := json.encode(j)
+	return ctx.send_response_to_client('application/json', json_s)
+}
+
+// Response with a pretty-printed JSON result
+pub fn (mut ctx Context) json_pretty[T](j T) Result {
+	json_s := json.encode(j, prettify: true)
+	return ctx.send_response_to_client('application/json', json_s)
+}
+
+// Response HTTP_OK with file as payload
+fn (ctx &Context) custom_mime_type(ext string) ?string {
+	if ct := ctx.custom_mime_types[ext] {
+		return ct
+	}
+	if unsafe { ctx.custom_mime_types_ref != nil } {
+		custom_mime_types := unsafe { *ctx.custom_mime_types_ref }
+		return custom_mime_types[ext]
+	}
+	return none
+}
+
+pub fn (mut ctx Context) file(file_path string) Result {
+	if !os.exists(file_path) {
+		eprintln('[veb] file "${file_path}" does not exist')
+		return ctx.not_found()
+	}
+	ext := os.file_ext(file_path)
+	mut content_type := ctx.content_type
+	if content_type.len == 0 {
+		if ct := ctx.custom_mime_type(ext) {
+			content_type = ct
+		} else {
+			content_type = mime_types[ext]
+		}
+	}
+	if content_type.len == 0 {
+		// Unknown extension: sniff the content instead of failing, so
+		// extension-less downloads and captures still serve. Known types
+		// always win; sniffed output is never relabelled afterwards.
+		mut f := os.open(file_path) or {
+			eprintln('[veb] error while trying to open file: ${err.msg()}')
+			return ctx.server_error('could not open resource')
+		}
+		defer {
+			f.close()
+		}
+		// Include up to three continuation bytes for a UTF-8 sequence crossing byte 512.
+		mut head := []u8{len: 515}
+		n := f.read(mut head) or { 0 }
+		content_type = if n > 0 {
+			http.detect_content_type(head[..n])
+		} else {
+			'text/plain; charset=utf-8'
+		}
+	}
+	return ctx.send_file(content_type, file_path)
+}
+
+fn (mut ctx Context) send_file(content_type string, file_path string) Result {
+	mut file := os.open(file_path) or {
+		eprint('[veb] error while trying to open file: ${err.msg()}')
+		ctx.res.set_status(.not_found)
+		return ctx.text('resource does not exist')
+	}
+	// seek from file end to get the file size
+	file.seek(0, .end) or {
+		eprintln('[veb] error while trying to read file: ${err.msg()}')
+		return ctx.server_error('could not read resource')
+	}
+	file_size := file.tell() or {
+		eprintln('[veb] error while trying to read file: ${err.msg()}')
+		return ctx.server_error('could not read resource')
+	}
+	file.close()
+	// Check which encodings the client accepts
+	accept_encoding := ctx.req.header.values(.accept_encoding).join(',')
+	client_accepts_zstd := client_accepts_encoding(accept_encoding, 'zstd')
+	client_accepts_gzip := client_accepts_encoding(accept_encoding, 'gzip')
+	max_size_bytes := ctx.static_compression_max_size
+	should_use_static_compression := ctx.should_use_static_compression_for_mime(content_type)
+	// Determine which compression modes are enabled
+	use_zstd := should_use_static_compression && ((ctx.enable_static_zstd && client_accepts_zstd)
+		|| (ctx.enable_static_compression && client_accepts_zstd))
+	use_gzip := should_use_static_compression && ((ctx.enable_static_gzip && client_accepts_gzip)
+		|| (ctx.enable_static_compression && client_accepts_gzip))
+	// Try to serve pre-compressed files if any compression is enabled
+	if use_zstd || use_gzip {
+		orig_mtime := os.file_last_mod_unix(file_path)
+		// Try zstd first if enabled (better compression), then gzip
+		if use_zstd {
+			if ctx.serve_precompressed_file(content_type, file_path, '.zst', 'zstd', orig_mtime) {
+				return Result{}
+			}
+		}
+		if use_gzip {
+			if ctx.serve_precompressed_file(content_type, file_path, '.gz', 'gzip', orig_mtime) {
+				return Result{}
+			}
+		}
+		// No pre-compressed file available: create one if file is small enough
+		if file_size < max_size_bytes {
+			// Load, compress, save, and serve
+			data := os.read_file(file_path) or {
+				eprintln('[veb] error while trying to read file: ${err.msg()}')
+				return ctx.server_error('could not read resource')
+			}
+			// Try zstd first if enabled, then gzip
+			if use_zstd {
+				if result := ctx.serve_compressed_static(content_type, file_path, data, .zstd) {
+					return result
+				}
+			}
+			if use_gzip {
+				if result := ctx.serve_compressed_static(content_type, file_path, data, .gzip) {
+					return result
+				}
+			}
+			// Compression failed: continue with the identity representation below.
+		}
+	}
+	// Identity validators never apply to the encoded representations above.
+	ctx.vary_static_encoding()
+	mtime := os.file_last_mod_unix(file_path)
+	etag := static_file_etag(file_path) or { return ctx.server_error('could not read resource') }
+	last_modified := time.unix(mtime).http_header_string()
+	// A validator the client already has skips the whole transfer (RFC 7232).
+	// If-None-Match takes precedence over If-Modified-Since.
+	if_none_match_values := ctx.req.header.values(.if_none_match)
+	is_retrieval := ctx.req.method in [.get, .head]
+	if if_none_match_values.len > 0 {
+		if etag_matches(if_none_match_values.join(','), etag) {
+			if is_retrieval {
+				return ctx.send_not_modified(etag, last_modified)
+			}
+			ctx.res.set_status(.precondition_failed)
+			return ctx.send_response_to_client('text/plain', '')
+		}
+	} else if if_modified_since := ctx.req.header.get(.if_modified_since) {
+		if is_retrieval && static_not_modified_since(if_modified_since, mtime) {
+			return ctx.send_not_modified(etag, last_modified)
+		}
+	}
+	// Takeover mode: load file in memory (backward compatibility)
+	if ctx.takeover_mode != .none {
+		data := os.read_file(file_path) or {
+			eprintln('[veb] error while trying to read file: ${err.msg()}')
+			return ctx.server_error('could not read resource')
+		}
+		// A satisfiable single range is served as 206 straight from the
+		// identity bytes, skipping the compression machinery below.
+		if range_header := ctx.req.header.get(.range) {
+			if ctx.req.method == .get
+				&& if_range_holds(ctx.req.header.get(.if_range) or { '' }, etag, mtime) {
+				if rng := parse_range_header(range_header, i64(data.len)) {
+					if rng.start >= i64(data.len) {
+						return ctx.send_range_not_satisfiable(i64(data.len))
+					}
+					return ctx.send_file_range(content_type, file_path, rng, etag,
+						last_modified)
+				}
+			}
+		}
+		ctx.res.header.set(.etag, etag)
+		ctx.res.header.set(.last_modified, last_modified)
+		ctx.res.header.set(.accept_ranges, 'bytes')
+		return ctx.send_response_to_client(content_type, data)
+	}
+	// Default: serve uncompressed file in streaming mode (zero-copy sendfile).
+	// Range requests fall through to the full 200 body here: the streaming
+	// transports have no offset support yet, and a full response is always legal.
+	ctx.return_type = .file
+	ctx.return_file = file_path
+	ctx.res.header.set(.content_length, file_size.str())
+	ctx.res.header.set(.etag, etag)
+	ctx.res.header.set(.last_modified, last_modified)
+	ctx.res.header.set(.accept_ranges, 'bytes')
+	return ctx.send_response_to_client(content_type, '')
+}
+
+fn normalize_static_compression_mime_type(mime_type string) string {
+	return mime_type.all_before(';').trim_space().to_lower()
+}
+
+fn (ctx &Context) should_use_static_compression_for_mime(content_type string) bool {
+	if ctx.static_compression_mime_types.len == 0 {
+		return true
+	}
+	normalized_content_type := normalize_static_compression_mime_type(content_type)
+	if normalized_content_type == '' {
+		return false
+	}
+	for mime_type in ctx.static_compression_mime_types {
+		if normalize_static_compression_mime_type(mime_type) == normalized_content_type {
+			return true
+		}
+	}
+	return false
+}
+
+fn sanitize_cache_path_component(component string) string {
+	mut sanitized := component.trim_space()
+	if sanitized == '' {
+		return 'unknown'
+	}
+	for invalid_char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|'] {
+		sanitized = sanitized.replace(invalid_char, '_')
+	}
+	return sanitized
+}
+
+fn static_compression_cache_path(file_path string, ext string) string {
+	real_file_path := os.real_path(file_path)
+	path_hash := hash.sum64_string(real_file_path, 0).hex_full()
+	app_dir_name := sanitize_cache_path_component(os.base(os.getwd()))
+	static_dir_name := sanitize_cache_path_component(os.base(os.dir(real_file_path)))
+	file_name := sanitize_cache_path_component(os.file_name(real_file_path))
+	return os.join_path(os.cache_dir(), 'veb', 'static_compression', app_dir_name, static_dir_name,
+		'${file_name}.${path_hash}${ext}')
+}
+
+fn (mut ctx Context) serve_compressed_path_if_fresh(content_type string, compressed_path string, encoding_name string, orig_mtime i64) bool {
+	if !os.exists(compressed_path) {
+		return false
+	}
+	compressed_mtime := os.file_last_mod_unix(compressed_path)
+	if compressed_mtime < orig_mtime {
+		return false
+	}
+	if _ := ctx.encoded_if_none_match_star() {
+		return true
+	}
+	// Serve existing compressed file in streaming mode (zero-copy)
+	ctx.return_type = .file
+	ctx.return_file = compressed_path
+	ctx.res.header.set(.content_encoding, encoding_name)
+	ctx.res.header.set(.vary, 'Accept-Encoding')
+	compressed_size := os.file_size(compressed_path)
+	ctx.res.header.set(.content_length, compressed_size.str())
+	ctx.already_compressed = true
+	ctx.send_response_to_client(content_type, '')
+	return true
+}
+
+// serve_precompressed_file serves an existing pre-compressed file (.zst or .gz) if it exists and is fresh.
+// Returns true if the file was served, false otherwise.
+fn (mut ctx Context) serve_precompressed_file(content_type string, file_path string, ext string, encoding_name string, orig_mtime i64) bool {
+	// First prefer manually pre-compressed files beside the original static file.
+	side_by_side_path := '${file_path}${ext}'
+	if ctx.serve_compressed_path_if_fresh(content_type, side_by_side_path, encoding_name,
+		orig_mtime)
+	{
+		return true
+	}
+	// Then try veb-managed cache files under os.cache_dir().
+	cached_path := static_compression_cache_path(file_path, ext)
+	return ctx.serve_compressed_path_if_fresh(content_type, cached_path, encoding_name, orig_mtime)
+}
+
+// serve_compressed_static compresses data and serves it, optionally caching to disk.
+// Returns Result on success, none on compression failure.
+fn (mut ctx Context) serve_compressed_static(content_type string, file_path string, data string, encoding ContentEncoding) ?Result {
+	compressed, ext, encoding_name := match encoding {
+		.zstd {
+			c := zstd.compress(data.bytes()) or { return none }
+			c, '.zst', 'zstd'
+		}
+		.gzip {
+			c := gzip.compress(data.bytes()) or { return none }
+			c, '.gz', 'gzip'
+		}
+	}
+	if result := ctx.encoded_if_none_match_star() {
+		return result
+	}
+
+	compressed_path := static_compression_cache_path(file_path, ext)
+	// Try to save compressed version for future requests
+	mut write_success := true
+	cache_dir := os.dir(compressed_path)
+	os.mkdir_all(cache_dir) or {
+		eprintln('[veb] warning: could not create static compression cache dir `${cache_dir}`: ${err.msg()}')
+		write_success = false
+	}
+	if write_success {
+		os.write_file(compressed_path, compressed.bytestr()) or {
+			eprintln('[veb] warning: could not save ${ext} file in static compression cache: ${err.msg()}')
+			write_success = false
+		}
+	}
+	ctx.already_compressed = true
+	if write_success {
+		// Serve the newly cached file in streaming mode (zero-copy)
+		ctx.return_type = .file
+		ctx.return_file = compressed_path
+		ctx.res.header.set(.content_encoding, encoding_name)
+		ctx.res.header.set(.vary, 'Accept-Encoding')
+		ctx.res.header.set(.content_length, compressed.len.str())
+		return ctx.send_response_to_client(content_type, '')
+	} else {
+		// Fallback: serve compressed content from memory (no caching)
+		ctx.res.header.set(.content_encoding, encoding_name)
+		ctx.res.header.set(.vary, 'Accept-Encoding')
+		return ctx.send_response_to_client(content_type, compressed.bytestr())
+	}
+}
+
+// Response HTTP_OK with s as payload
+pub fn (mut ctx Context) ok(s string) Result {
+	mut mime := if ctx.content_type.len == 0 { 'text/plain' } else { ctx.content_type }
+	return ctx.send_response_to_client(mime, s)
+}
+
+// send an error 400 with a message
+pub fn (mut ctx Context) request_error(msg string) Result {
+	ctx.res.set_status(.bad_request)
+	return ctx.send_response_to_client('text/plain', msg)
+}
+
+// send an error 500 with a message
+pub fn (mut ctx Context) server_error(msg string) Result {
+	ctx.res.set_status(.internal_server_error)
+	return ctx.send_response_to_client('text/plain', msg)
+}
+
+// error_with answers a handler that declined to respond and returned an error
+// instead, which is what a `!veb.Result` handler does. The response is a JSON
+// envelope carrying the message. When the handler already chose a status with
+// `ctx.res.set_status`, it is kept, so such handlers still control 4xx
+// themselves; otherwise this is a 500.
+pub fn (mut ctx Context) error_with(err IError) Result {
+	if ctx.res.status_code == 0 {
+		ctx.res.set_status(.internal_server_error)
+	}
+	return ctx.json({
+		'error': err.msg()
+	})
+}
+
+// send an error with a custom status
+pub fn (mut ctx Context) server_error_with_status(s http.Status) Result {
+	ctx.res.set_status(s)
+	return ctx.send_response_to_client('text/plain', 'Server error')
+}
+
+// send a 204 No Content response without body and content-type
+pub fn (mut ctx Context) no_content() Result {
+	ctx.res.set_status(.no_content)
+	return ctx.send_response_to_client('', '')
+}
+
+@[params]
+pub struct RedirectParams {
+pub:
+	typ RedirectType
+}
+
+// Redirect to an url
+pub fn (mut ctx Context) redirect(url string, params RedirectParams) Result {
+	status := http.Status(params.typ)
+	ctx.res.set_status(status)
+	ctx.res.header.add(.location, url)
+	return ctx.send_response_to_client('text/plain', status.str())
+}
+
+// before_request is *always* the first function that is executed.
+// It can be overriden on your custom context. You can use it to
+// log information about the current request, like its target url,
+// client IP etc, or to enrich the request with common information,
+// by setting session cookies, adding custom headers etc.
+// For more control over the request, use the explicit Middleware
+// support described in https://modules.vlang.io/veb.html#middleware .
+pub fn (mut ctx Context) before_request() {
+}
+
+// returns a HTTP 404 response
+pub fn (mut ctx Context) not_found() Result {
+	ctx.res.set_status(.not_found)
+	return ctx.send_response_to_client('text/plain', '404 Not Found')
+}
+
+// method_not_allowed returns a HTTP 405 response, listing the methods the
+// matched route does accept in the `Allow` header.
+pub fn (mut ctx Context) method_not_allowed(allowed []http.Method) Result {
+	ctx.res.set_status(.method_not_allowed)
+	if allowed.len > 0 {
+		// The key is a literal and the values come from the Method enum, so a
+		// header-write failure here is not reachable, but the API is a Result.
+		ctx.res.header.add_custom('Allow', allowed.map(it.str()).join(',')) or {}
+	}
+	return ctx.send_response_to_client('text/plain', '405 Method Not Allowed')
+}
+
+// Gets a cookie by a key
+pub fn (ctx &Context) get_cookie(key string) ?string {
+	if cookie := ctx.req.cookie(key) {
+		return cookie.value
+	} else {
+		return none
+	}
+}
+
+// Sets a cookie
+pub fn (mut ctx Context) set_cookie(cookie http.Cookie) {
+	cookie_raw := cookie.str()
+	if cookie_raw == '' {
+		eprintln('[veb] error setting cookie: name of cookie is invalid.\n${cookie}')
+		return
+	}
+	ctx.res.header.add(.set_cookie, cookie_raw)
+}
+
+// set_content_type sets the Content-Type header to `mime`
+pub fn (mut ctx Context) set_content_type(mime string) {
+	ctx.content_type = mime
+}
+
+// takeover_conn prevents veb from automatically sending a response and closing
+// the connection. You are responsible for closing the connection.
+// In takeover mode if you call a Context method the response will be directly
+// send over the connection and you can send multiple responses.
+// This function is useful when you want to keep the connection alive and/or
+// send multiple responses. Like with the SSE.
+pub fn (mut ctx Context) takeover_conn() {
+	ctx.takeover_mode = .manual
+	ctx.prepare_takeover_conn()
+}
+
+fn (mut ctx Context) prepare_takeover_conn() {
+	if ctx.conn == unsafe { nil } && ctx.client_fd >= 0 {
+		// For the fasthttp backend: create a TcpConn from the raw fd on demand.
+		// Set the fd to blocking mode. fasthttp uses non-blocking sockets,
+		// but TcpConn.write() expects blocking behavior for reliable writes.
+		$if !windows {
+			flags := C.fcntl(ctx.client_fd, C.F_GETFL, 0)
+			if flags != -1 {
+				C.fcntl(ctx.client_fd, C.F_SETFL, flags & ~C.O_NONBLOCK)
+			}
+		}
+		ctx.conn = &net.TcpConn{
+			sock:          net.TcpSocket{
+				Socket: net.Socket{
+					handle: ctx.client_fd
+				}
+			}
+			handle:        ctx.client_fd
+			is_blocking:   true
+			read_timeout:  30 * time.second
+			write_timeout: 30 * time.second
+		}
+	} else if ctx.conn != unsafe { nil } {
+		// The connection exists but uses non-blocking I/O.
+		// Switch to blocking mode for reliable SSE writes.
+		fd := ctx.conn.handle
+		$if !windows {
+			flags := C.fcntl(fd, C.F_GETFL, 0)
+			if flags != -1 {
+				C.fcntl(fd, C.F_SETFL, flags & ~C.O_NONBLOCK)
+			}
+		}
+		ctx.conn.is_blocking = true
+		ctx.conn.set_read_timeout(30 * time.second)
+		ctx.conn.set_write_timeout(30 * time.second)
+	}
+}
+
+// takeover_conn_reusable prevents veb from automatically sending a response,
+// but lets veb keep the connection in the read loop after the handler returns.
+// The handler must write exactly one complete HTTP response with a clear body
+// boundary, such as Content-Length or a final chunk for Transfer-Encoding:
+// chunked. If the client asked to close the connection, veb will still close it.
+pub fn (mut ctx Context) takeover_conn_reusable() {
+	ctx.takeover_mode = .reusable
+	ctx.prepare_takeover_conn()
+}
+
+// user_agent returns the user-agent header for the current client
+pub fn (ctx &Context) user_agent() string {
+	return ctx.req.header.get(.user_agent) or { '' }
+}
+
+fn peer_ip_from_socket_handle(handle int) string {
+	address := net.peer_addr_from_socket_handle(handle) or { return '' }.str()
+	if address.contains(']:') {
+		return address.all_before(']:').all_after('[')
+	}
+	return address.all_before(':')
+}
+
+fn normalized_client_ip(address string) !string {
+	if address.contains(':') {
+		return net.canonical_ipv6(address)
+	}
+	return net.format_ip(net.parse_ip(address)!)
+}
+
+fn is_trusted_proxy(address string, trusted_proxies []string) bool {
+	ip := normalized_client_ip(address) or { return false }
+	for proxy in trusted_proxies {
+		trusted_ip := normalized_client_ip(proxy) or { continue }
+		if ip == trusted_ip {
+			return true
+		}
+	}
+	return false
+}
+
+// resolved_client_ip walks from the trusted socket peer toward the client,
+// stopping at the nearest untrusted address. An earlier prefix is unverified.
+// An invalid entry stops the walk at the last trusted hop; if every entry is
+// trusted, the left-most entry is the client address.
+fn resolved_client_ip(peer string, forwarded_for string, trusted_proxies []string) string {
+	if !is_trusted_proxy(peer, trusted_proxies) {
+		return peer
+	}
+	mut client := peer
+	entries := forwarded_for.split(',')
+	for i := entries.len - 1; i >= 0; i-- {
+		client = normalized_client_ip(entries[i].trim_space()) or { return client }
+		if !is_trusted_proxy(client, trusted_proxies) {
+			return client
+		}
+	}
+	return client
+}
+
+// ip returns the client's IP address, defaulting to the socket peer.
+// Forwarding headers are honoured only when the peer is in the app's
+// `trusted_proxies []string` field. X-Forwarded-For is walked right to left
+// until the nearest untrusted address. Only when it is absent are
+// CF-Connecting-IP and then X-Real-Ip used; trusted proxies must overwrite
+// or remove these single-address headers received from untrusted clients.
+pub fn (ctx &Context) ip() string {
+	mut peer := ''
+	if ctx.conn != unsafe { nil } {
+		peer = ctx.conn.peer_ip() or { '' }
+	}
+	if peer == '' && ctx.client_fd >= 0 {
+		peer = peer_ip_from_socket_handle(ctx.client_fd)
+	}
+	if is_trusted_proxy(peer, ctx.trusted_proxies) {
+		xff := ctx.req.header.values(.x_forwarded_for)
+		if xff.len > 0 {
+			return resolved_client_ip(peer, xff.join(','), ctx.trusted_proxies)
+		}
+		if cf := ctx.req.header.get_custom('CF-Connecting-IP') {
+			if cf.trim_space() != '' {
+				return normalized_client_ip(cf.trim_space()) or { peer }
+			}
+		}
+		if real_ip := ctx.req.header.get_custom('X-Real-Ip') {
+			if real_ip.trim_space() != '' {
+				return normalized_client_ip(real_ip.trim_space()) or { peer }
+			}
+		}
+	}
+	return peer
+}
+
+// time_to_render returns the time in milliseconds that it took to render the page
+pub fn (ctx &Context) time_to_render() i64 {
+	if ctx.page_gen_start == 0 {
+		return 0
+	}
+	return time.ticks() - ctx.page_gen_start
+}

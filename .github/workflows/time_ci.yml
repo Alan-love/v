@@ -1,0 +1,93 @@
+name: Time CI
+
+on:
+  workflow_call:
+
+concurrency:
+  group: time-time_ci-${{ github.ref == 'refs/heads/master' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  time-linux:
+    runs-on: ubuntu-latest
+    env:
+      # Stop a failing test session at its first failure instead of
+      # running the whole suite to completion; the remaining files
+      # add no signal.
+      VTEST_FAIL_FAST: '1'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build V
+        uses: ./.github/actions/setup-v
+        with:
+          symlink: false
+      - name: Test time functions in a timezone UTC-12
+        run: TZ=Etc/GMT+12 ./v test vlib/time/
+      - name: Test time functions in a timezone UTC-3
+        run: TZ=Etc/GMT+3 ./v test vlib/time/
+      - name: Test time functions in a timezone UTC+3
+        run: TZ=Etc/GMT-3 ./v test vlib/time/
+      - name: Test time functions in a timezone UTC+12
+        run: TZ=Etc/GMT-12 ./v test vlib/time/
+      - name: Test in a timezone using daylight saving (Europe/Paris)
+        run: TZ=Europe/Paris ./v test vlib/time/
+
+  time-macos:
+    runs-on: macos-15
+    env:
+      # Stop a failing test session at its first failure instead of
+      # running the whole suite to completion; the remaining files
+      # add no signal.
+      VTEST_FAIL_FAST: '1'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build V
+        uses: ./.github/actions/setup-v
+        with:
+          symlink: false
+      - name: Test time functions in a timezone UTC-12
+        run: TZ=Etc/GMT+12 ./v test vlib/time/
+      - name: Test time functions in a timezone UTC-3
+        run: TZ=Etc/GMT+3 ./v test vlib/time/
+      - name: Test time functions in a timezone UTC+3
+        run: TZ=Etc/GMT-3 ./v test vlib/time/
+      - name: Test time functions in a timezone UTC+12
+        run: TZ=Etc/GMT-12 ./v test vlib/time/
+      - name: Test in a timezone using daylight saving (Europe/Paris)
+        run: TZ=Europe/Paris ./v test vlib/time/
+
+  time-windows:
+    runs-on: windows-2025
+    env:
+      # Stop a failing test session at its first failure instead of
+      # running the whole suite to completion; the remaining files
+      # add no signal.
+      VTEST_FAIL_FAST: '1'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build V
+        uses: ./.github/actions/setup-v
+        with:
+          symlink: false
+      - name: Test time functions in a timezone UTC-12
+        run: tzutil /s "Dateline Standard Time" && ./v test vlib/time/
+      - name: Test time functions in a timezone UTC-3
+        run: tzutil /s "Greenland Standard Time" && ./v test vlib/time/
+      - name: Test time functions in a timezone UTC+3
+        run: tzutil /s "Russian Standard Time" && ./v test vlib/time/
+      - name: Test time functions in a timezone UTC+12
+        run: tzutil /s "New Zealand Standard Time" && ./v test vlib/time/
+      - name: Test in a timezone using daylight saving (Europe/Paris)
+        run: tzutil /s "W. Europe Standard Time" && ./v test vlib/time/

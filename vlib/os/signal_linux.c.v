@@ -1,0 +1,47 @@
+@[has_globals]
+module os
+
+#flag -lpthread
+
+fn C.pthread_self() uint
+
+// g_main_thread_id and is_main_thread can be used to determine if the current thread is the main thread.
+// if need to get the tid of the main thread, can use the global variable g_main_thread_id
+// instead of using thread_id() every time.
+__global g_main_thread_id = signal_thread_id()
+
+@[inline]
+fn signal_thread_id() u64 {
+	// `$else` keeps pthread_self out of freestanding builds, whose native backends
+	// would otherwise still emit the unreachable call
+	$if vlibc ?&& freestanding {
+		return u64(vlibc_sys_gettid())
+	} $else $if freestanding || syscalls {
+		return bf_gettid()
+	} $else {
+		return u64(C.pthread_self())
+	}
+}
+
+// is_main_thread returns whether the current thread is the main thread.
+pub fn is_main_thread() bool {
+	return g_main_thread_id == signal_thread_id()
+}
+
+@[typedef]
+pub struct C.sigset_t {}
+
+fn C.sigaddset(set &C.sigset_t, signum i32) i32
+fn C.sigemptyset(set &C.sigset_t)
+fn C.sigprocmask(how i32, set &C.sigset_t, oldset &C.sigset_t) i32
+
+fn signal_ignore_internal(args ...Signal) {
+	$if !android && !macos && !openbsd {
+		mask1 := C.sigset_t{}
+		C.sigemptyset(&mask1)
+		for arg in args {
+			C.sigaddset(&mask1, int(arg))
+		}
+		C.sigprocmask(C.SIG_BLOCK, &mask1, unsafe { nil })
+	}
+}

@@ -38,6 +38,9 @@ extern "C" {
 #define FONTSTASH_MALLOC malloc
 #define FONTSTASH_REALLOC realloc
 #define FONTSTASH_FREE free
+// __v_ start
+#define FONTSTASH_MALLOC_ATOMIC malloc
+// __v_ end
 #endif
 
 enum FONSflags {
@@ -100,9 +103,53 @@ struct FONStextIter {
 };
 typedef struct FONStextIter FONStextIter;
 
+// Shared context layout for the V and sokol bindings.
+#ifndef FONS_VERTEX_COUNT
+#	define FONS_VERTEX_COUNT 1024
+#endif
+#ifndef FONS_MAX_STATES
+#	define FONS_MAX_STATES 20
+#endif
+
+typedef struct FONSfont FONSfont;
+typedef struct FONSatlas FONSatlas;
+
+struct FONSstate
+{
+	int font;
+	int align;
+	float size;
+	unsigned int color;
+	float blur;
+	float spacing;
+};
+typedef struct FONSstate FONSstate;
+
+struct FONScontext
+{
+	FONSparams params;
+	float itw,ith;
+	unsigned char* texData;
+	int dirtyRect[4];
+	FONSfont** fonts;
+	FONSatlas* atlas;
+	int cfonts;
+	int nfonts;
+	float verts[FONS_VERTEX_COUNT*2];
+	float tcoords[FONS_VERTEX_COUNT*2];
+	unsigned int colors[FONS_VERTEX_COUNT];
+	int nverts;
+	unsigned char* scratch;
+	int nscratch;
+	FONSstate states[FONS_MAX_STATES];
+	int nstates;
+	void (*handleError)(void* uptr, int error, int val);
+	void* errorUptr;
+};
+
 typedef struct FONScontext FONScontext;
 
-// Contructor and destructor.
+// Constructor and destructor.
 FONS_DEF FONScontext* fonsCreateInternal(FONSparams* params);
 FONS_DEF void fonsDeleteInternal(FONScontext* s);
 
@@ -115,6 +162,7 @@ FONS_DEF int fonsExpandAtlas(FONScontext* s, int width, int height);
 FONS_DEF int fonsResetAtlas(FONScontext* stash, int width, int height);
 
 // Add fonts
+FONS_DEF int fonsAddFontMem(FONScontext* stash, const char* name, unsigned char* data, int dataSize, int freeData);
 FONS_DEF int fonsGetFontByName(FONScontext* s, const char* name);
 FONS_DEF int fonsAddFallbackFont(FONScontext* stash, int base, int fallback);
 
@@ -365,12 +413,6 @@ static int fons__tt_getGlyphKernAdvance(FONSttFontImpl *font, int glyph1, int gl
 #ifndef FONS_INIT_ATLAS_NODES
 #	define FONS_INIT_ATLAS_NODES 256
 #endif
-#ifndef FONS_VERTEX_COUNT
-#	define FONS_VERTEX_COUNT 1024
-#endif
-#ifndef FONS_MAX_STATES
-#	define FONS_MAX_STATES 20
-#endif
 #ifndef FONS_MAX_FALLBACKS
 #	define FONS_MAX_FALLBACKS 20
 #endif
@@ -424,18 +466,6 @@ struct FONSfont
 	int fallbacks[FONS_MAX_FALLBACKS];
 	int nfallbacks;
 };
-typedef struct FONSfont FONSfont;
-
-struct FONSstate
-{
-	int font;
-	int align;
-	float size;
-	unsigned int color;
-	float blur;
-	float spacing;
-};
-typedef struct FONSstate FONSstate;
 
 struct FONSatlasNode {
 	short x, y, width;
@@ -449,29 +479,7 @@ struct FONSatlas
 	int nnodes;
 	int cnodes;
 };
-typedef struct FONSatlas FONSatlas;
 
-struct FONScontext
-{
-	FONSparams params;
-	float itw,ith;
-	unsigned char* texData;
-	int dirtyRect[4];
-	FONSfont** fonts;
-	FONSatlas* atlas;
-	int cfonts;
-	int nfonts;
-	float verts[FONS_VERTEX_COUNT*2];
-	float tcoords[FONS_VERTEX_COUNT*2];
-	unsigned int colors[FONS_VERTEX_COUNT];
-	int nverts;
-	unsigned char* scratch;
-	int nscratch;
-	FONSstate states[FONS_MAX_STATES];
-	int nstates;
-	void (*handleError)(void* uptr, int error, int val);
-	void* errorUptr;
-};
 
 #ifdef STB_TRUETYPE_IMPLEMENTATION
 
@@ -563,7 +571,7 @@ static FONSatlas* fons__allocAtlas(int w, int h, int nnodes)
 	atlas->height = h;
 
 	// Allocate space for skyline nodes
-	atlas->nodes = (FONSatlasNode*)FONTSTASH_MALLOC(sizeof(FONSatlasNode) * nnodes);
+	atlas->nodes = (FONSatlasNode*)FONTSTASH_MALLOC_ATOMIC(sizeof(FONSatlasNode) * nnodes);
 	if (atlas->nodes == NULL) goto error;
 	memset(atlas->nodes, 0, sizeof(FONSatlasNode) * nnodes);
 	atlas->nnodes = 0;
@@ -780,7 +788,7 @@ FONScontext* fonsCreateInternal(FONSparams* params)
 	// Create texture for the cache.
 	stash->itw = 1.0f/stash->params.width;
 	stash->ith = 1.0f/stash->params.height;
-	stash->texData = (unsigned char*)FONTSTASH_MALLOC(stash->params.width * stash->params.height);
+	stash->texData = (unsigned char*)FONTSTASH_MALLOC_ATOMIC(stash->params.width * stash->params.height);
 	if (stash->texData == NULL) goto error;
 	memset(stash->texData, 0, stash->params.width * stash->params.height);
 
@@ -901,7 +909,7 @@ static int fons__allocFont(FONScontext* stash)
 	if (font == NULL) goto error;
 	memset(font, 0, sizeof(FONSfont));
 
-	font->glyphs = (FONSglyph*)FONTSTASH_MALLOC(sizeof(FONSglyph) * FONS_INIT_GLYPHS);
+	font->glyphs = (FONSglyph*)FONTSTASH_MALLOC_ATOMIC(sizeof(FONSglyph) * FONS_INIT_GLYPHS);
 	if (font->glyphs == NULL) goto error;
 	font->cglyphs = FONS_INIT_GLYPHS;
 	font->nglyphs = 0;
@@ -1657,7 +1665,7 @@ FONS_DEF int fonsExpandAtlas(FONScontext* stash, int width, int height)
 			return 0;
 	}
 	// Copy old texture data over.
-	data = (unsigned char*)FONTSTASH_MALLOC(width * height);
+	data = (unsigned char*)FONTSTASH_MALLOC_ATOMIC(width * height);
 	if (data == NULL)
 		return 0;
 	for (i = 0; i < stash->params.height; i++) {

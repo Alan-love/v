@@ -1,0 +1,1756 @@
+# veb - the V Web Server
+
+A simple yet powerful web server with built-in routing, parameter handling, templating, and other
+features.
+
+Generate client-ready API specifications with [typed OpenAPI documents](OPENAPI.md).
+
+## Features
+
+- **Very fast** performance of C on the web.
+- **Templates are precompiled** all errors are visible at compilation time, not at runtime.
+- **Middleware** functionality similar to other big frameworks.
+- **HTTPS support** directly from `veb` via `mbedtls`.
+- **Method-aware route middleware** for protecting only selected HTTP verbs.
+- **Static compression** with gzip/zstd, including manual pre-compression support.
+- **Controllers** to split up your apps logic.
+- **Graceful shutdown** support in the `new_veb` backend.
+- **Easy to deploy** just one binary file that also includes all templates. No need to install any
+  dependencies.
+
+## Quick Start
+
+Run your veb app with a live reload via `v -d veb_livereload watch run .`
+Compiler options before `watch` are forwarded to the app's compiler command.
+Options after `watch`, such as `v watch -d veb_livereload run .`, also work.
+
+Stylesheet changes are applied in place. Changes to other static assets trigger a
+full reload so updated scripts and images are fetched. Page or template changes
+preserve the DOM state unless scripts or head elements changed; those changes
+also reload the page so the browser applies them.
+
+Page and template edits update the browser while preserving scroll position, focus,
+and typed form values when scripts and head elements stay the same.
+No need to quit the app, rebuild it, and refresh the page in the browser!
+
+* A `.v` file or a template (anywhere under `templates/`): `v watch` rebuilds and
+  restarts the app, then the page fetches itself again and updates only what changed.
+  The previous version keeps serving while the new one builds. If the build fails, it
+  keeps running, and the page shows the compiler errors until the next successful build.
+  `v watch --no-build-first` stops the app before each build instead.
+* A file served by a `veb.StaticHandler` (for example `static/css/main.css`): the
+  running app notices the change itself, with no rebuild. Stylesheets are swapped in
+  place; other files reload the page.
+
+Note: this works by injecting a small `<script>` tag before the ending `</html>` tag of the page,
+that keeps one Server-Sent Events connection open to the app. In other words, it works for
+template pages that have that `</html>` tag, or for ones that were produced by `ctx.html()` and that
+also have that closing tag, but not for ones produced by `ctx.text()` .
+Pages that were the result of a POST request, and pages that fail to update, are reloaded instead.
+A small notice in the corner of the page shows when the app is rebuilding and when the
+page was updated; hide it with `-d veb_livereload_no_toast`.
+
+The live updates are not available for apps served over HTTPS (`veb.run_at` with an `ssl_config`),
+or behind a proxy that blocks long-lived connections. Those can keep using the older script, which
+polls the app and reloads the whole page after a restart:
+`v watch -d veb_livereload -d veb_livereload_polling run .`
+(set its interval with `-d veb_livereload_poll_ms=500`).
+
+While the app restarts, the page retries the connection every 250 ms; each failed attempt
+shows up in the browser's network log. With `v watch --no-build-first`, the app is down for
+the whole build: `-d veb_livereload_retry_max_ms=1000` makes the retries back off, doubling
+from 250 ms up to that cap, for fewer failed attempts at the cost of a slower update.
+
+## Port already in use
+
+When `lsof` finds a process listening on the requested TCP port, veb displays its PID and asks
+whether to terminate it. Reply `y` to send the process `SIGTERM`; any other response leaves it
+running.
+
+## Deploying veb apps
+
+All the code, including HTML templates, is in one binary file. That's all you need to deploy.
+Use the `-prod` flag when building for production.
+
+## Signed-cookie sessions
+
+`ctx.session(veb.SessionOptions{secret: secret})` loads a string map from a signed cookie.
+Use a strong, unpredictable secret shared by the instances serving your application. Missing,
+expired or invalid cookies start an empty session; an empty secret disables loading and saving.
+
+```v ignore
+opts := veb.SessionOptions{secret: app.session_secret, secure: true}
+mut session := ctx.session(opts)
+session.set('user', 'ada')
+ctx.save_session(session)
+user := session.get('user') or { 'guest' }
+// To delete the cookie, use ctx.clear_session(opts).
+```
+
+All state is stored in the cookie: it is signed, but **not encrypted**. Clients can read its
+contents. Keep values small enough for browser cookie limits, and store confidential data on
+the server. Keys and values may be empty strings. `SessionOptions` controls the cookie name,
+path, lifetime in seconds, `secure` and `http_only` flags; HTTP-only defaults to true and
+`secure` defaults to false, so enable it when serving over HTTPS. Call `save_session` after
+changes; `set` alone only changes the in-memory session.
+
+## Getting Started
+
+To start, you must import the module `veb` and define a structure which will
+represent your app and a structure which will represent the context of a request.
+These structures must be declared with the `pub` keyword.
+
+Pass both types explicitly when starting the server: `veb.run[App, Context](mut app, 8080)` or
+`veb.run_at[App, Context](mut app, port: 8080)!`. The context type cannot be inferred from the
+application argument; omitting the type arguments reports a generic type inference error.
+Using only `[App]` is also incomplete: pass `[App, Context]` to supply the request context type.
+
+Declare a route with separate path and HTTP method attributes, for example `@['/'; get]`.
+
+**Example:**
+
+```v
+module main
+
+import veb
+
+pub struct User {
+pub mut:
+	name string
+	id   int
+}
+
+// Our context struct must embed `veb.Context`!
+pub struct Context {
+	veb.Context
+pub mut:
+	// In the context struct we store data that could be different
+	// for each request. Like a User struct or a session id
+	user       User
+	session_id string
+}
+
+pub struct App {
+pub:
+	// In the app struct we store data that should be accessible by all endpoints.
+	// For example, a database or configuration values.
+	secret_key string
+}
+
+// This is how endpoints are defined in veb. This is the index route
+pub fn (app &App) index(mut ctx Context) veb.Result {
+	return ctx.html('<html><body><h1>Hello V!</h1><p>The secret key is "${app.secret_key}"</body></html>')
+}
+
+fn main() {
+	mut app := &App{
+		secret_key: 'secret'
+	}
+	// Pass the App and context type and start the web server on port 8080
+	veb.run[App, Context](mut app, 8080)
+}
+```
+
+You can use the `App` struct for data you want to keep during the lifetime of your program,
+or for data that you want to share between different routes.
+
+A new `Context` struct is created every time a request is received,
+so it can contain different data for each request.
+
+## Parallel picoev workers
+
+The default non-SSL picoev backend can start more than one event loop by setting
+`nr_workers` in `RunParams`:
+
+```v
+module main
+
+import runtime
+import veb
+
+pub struct Context {
+	veb.Context
+}
+
+pub struct App {}
+
+pub fn (app &App) index(mut ctx Context) veb.Result {
+	return ctx.text('Hello from parallel veb')
+}
+
+fn main() {
+	mut app := &App{}
+	veb.run_at[App, Context](mut app,
+		host:       '0.0.0.0'
+		port:       8080
+		nr_workers: runtime.nr_jobs()
+	) or { panic(err) }
+}
+```
+
+`nr_workers` defaults to `1` to preserve the historical single-loop behavior.
+It controls the default non-SSL picoev backend (currently on Linux or Termux).
+With `-d use_openssl`, it also limits concurrent TLS handshakes, so the default
+serializes handshakes. When running with `-d new_veb`, the fasthttp backend is
+already multi-threaded and ignores `nr_workers`.
+
+## Request-scoped allocation with `-prealloc`
+
+When a `veb` app runs on the `fasthttp` backend and is compiled with
+`-prealloc`, each request is handled inside a scoped prealloc arena created by
+`fasthttp`. V allocations made while decoding the request, creating the
+`veb.Context`, matching routes, running middleware, rendering templates, and
+serializing the response all use that request arena.
+
+The arena is freed after the response has been sent, not merely when the route
+handler returns. On macOS and BSD, the response buffer can be retained by the
+connection while `kqueue` finishes writing it; the arena is detached from the
+request thread and freed after the write completes. This keeps request-local
+allocations cheap while preserving response-buffer lifetime.
+
+When a handler starts V `spawn` work while the request scope is active, the
+generated thread wrapper retains the request arena until the spawned function
+returns, so veb app code does not need to manually copy request strings just to
+pass them to a background task. Void spawned functions also run inside their own
+scoped arena, which is freed at thread exit. Do not store request-scoped strings,
+arrays, maps, `Context` values, or template output in app fields, globals, or
+caches unless you deliberately copy them into longer-lived storage. Process
+startup data, route tables, static file maps, database pools, and allocations
+made directly by C libraries are not part of the per-request arena.
+
+To trace request arena allocation and free points while developing, build with:
+
+```sh
+v -prealloc -d trace_prealloc -d new_veb run .
+```
+
+## HTTPS
+
+To serve HTTPS directly from `veb`, pass an SSL configuration in `RunParams`.
+The default backend expects `mbedtls.SSLConnectConfig`. When compiling with
+`-d use_openssl`, use `openssl.SSLConnectConfig` instead. For example, run the
+following OpenSSL-backed server with `v -d use_openssl run .`:
+
+```v oksyntax
+module main
+
+import net.openssl
+import veb
+
+pub struct Context {
+	veb.Context
+}
+
+pub struct App {}
+
+pub fn (app &App) index(mut ctx Context) veb.Result {
+	return ctx.text('Hello over HTTPS')
+}
+
+fn main() {
+	mut app := &App{}
+	veb.run_at[App, Context](mut app,
+		host:       '0.0.0.0'
+		port:       8443
+		family:     .ip
+		ssl_config: openssl.SSLConnectConfig{
+			cert:     'certs/server.crt'
+			cert_key: 'certs/server.key'
+		}
+	) or { panic(err) }
+}
+```
+
+## Graceful shutdown
+
+When running with `-d new_veb`, the underlying server supports graceful
+shutdown. Once shutdown begins, it stops accepting new requests, waits for
+in-flight requests to finish, and only then exits. This is useful for deploys,
+tests, and management endpoints that trigger a stop after sending a response.
+
+You can store the server handle in your app by adding an optional
+`init_server(server &veb.Server)` method:
+
+```v
+module main
+
+import veb
+
+pub struct App {
+pub mut:
+	server &veb.Server = unsafe { nil }
+}
+
+pub fn (mut app App) init_server(server &veb.Server) {
+	app.server = server
+}
+```
+
+`veb.Server` forwards `wait_till_running()` and `shutdown(timeout: ...)`
+to the `new_veb` backend. These lifecycle controls are available only when
+running with `-d new_veb` without SSL.
+
+## Defining endpoints
+
+To add endpoints to your web server, you must extend the `App` struct.
+For routing you can either use auto-mapping of function names or specify the path as an attribute.
+The function expects a parameter of your Context type and a response of the type `veb.Result`
+(or `!veb.Result` when the endpoint can fail, see Handlers that return `!veb.Result`).
+
+**Example:**
+
+```v ignore
+// This endpoint can be accessed via http://server:port/hello
+pub fn (app &App) hello(mut ctx Context) veb.Result {
+	return ctx.text('Hello')
+}
+
+// This endpoint can be accessed via http://server:port/foo
+@['/foo']
+pub fn (app &App) world(mut ctx Context) veb.Result {
+	return ctx.text('World')
+}
+```
+
+### HTTP verbs
+
+To use any HTTP verbs (or methods, as they are properly called),
+such as `@[post]`, `@[get]`, `@[put]`, `@[patch]` or `@[delete]`
+you can simply add the attribute before the function definition.
+
+**Example:**
+
+```v ignore
+// only GET requests to http://server:port/world are handled by this method
+@[get]
+pub fn (app &App) world(mut ctx Context) veb.Result {
+	return ctx.text('World')
+}
+
+// only POST requests to http://server:port/product/create are handled by this method
+@['/product/create'; post]
+pub fn (app &App) create_product(mut ctx Context) veb.Result {
+	return ctx.text('product')
+}
+```
+
+By default, endpoints are marked as GET requests only. It is also possible to
+add multiple HTTP verbs per endpoint.
+
+**Example:**
+
+```v ignore
+// only GET and POST requests to http://server:port/login are handled by this method
+@['/login'; get; post]
+pub fn (app &App) login(mut ctx Context) veb.Result {
+	if ctx.req.method == .get {
+		// show the login page on a GET request
+		return ctx.html('<h1>Login page</h1><p>todo: make form</p>')
+	} else {
+		// request method is POST
+		password := ctx.form['password']
+		// validate password length
+		if password.len < 12 {
+			return ctx.text('password is too weak!')
+		} else {
+			// we receive a POST request, so we want to explicitly tell the browser
+			// to send a GET request to the profile page.
+			return ctx.redirect('/profile')
+		}
+	}
+}
+```
+
+### Request forms
+
+For `POST`, `PUT` and `PATCH` requests, `ctx.form` contains decoded form fields.
+With `Content-Type: application/json`, a JSON object supplies its string, number and boolean
+fields as strings: `{"name":"x","id":3}` becomes `{'name': 'x', 'id': '3'}`.
+Media type matching ignores case and accepts parameters such as `charset=utf-8`.
+Whitespace around a JSON object is accepted. Nested objects, arrays and `null` fields are skipped;
+use `ctx.req.data` or `ctx.bind[T]()` when you need the full structure.
+The original request body remains available in `ctx.req.data`.
+Malformed JSON and a root value other than an object, including `null`, receive `400 Bad Request`.
+
+URL-encoded bodies continue to populate `ctx.form`, and multipart requests also populate
+`ctx.files`. A JSON body requires its JSON content type; veb does not infer it from the body.
+
+### Routes with Parameters
+
+Parameters are passed directly to an endpoint route using the colon sign `:`. The route
+parameters are passed as arguments. V will cast the parameter to any of V's primitive types
+(`string`, `int` etc,).
+
+To pass a parameter to an endpoint, you simply define it inside an attribute, e. g.
+`@['/hello/:user]`.
+After it is defined in the attribute, you have to add it as a function parameter.
+Parameters after `ctx` are populated from strings, so they currently must be `string`,
+integer, or `bool`.
+
+**Example:**
+
+```v ignore
+// V will pass the parameter 'user' as a string
+           vvvv
+@['/hello/:user']                             vvvv
+pub fn (app &App) hello_user(mut ctx Context, user string) veb.Result {
+	return ctx.text('Hello ${user}')
+}
+
+// V will pass the parameter 'id' as an int
+              vv
+@['/document/:id']                              vv
+pub fn (app &App) get_document(mut ctx Context, id int) veb.Result {
+	return ctx.text('Document ${id}')
+}
+```
+
+If we visit http://localhost:port/hello/vaesel we would see the text `Hello vaesel`.
+
+### Routes with Parameter Arrays
+
+If you want multiple parameters in your route and if you want to parse the parameters
+yourself, or you want a wildcard route, you can add `...` after the `:` and name,
+e.g. `@['/:path...']`.
+
+This will match all routes after `'/'`. For example, the url `/path/to/test` would give
+`path = '/path/to/test'`.
+
+```v ignore
+         vvv
+@['/:path...']                              vvvv
+pub fn (app &App) wildcard(mut ctx Context, path string) veb.Result {
+	return ctx.text('URL path = "${path}"')
+}
+```
+
+### Query, Form and Files
+
+You have direct access to query values by accessing the `query` field on your context struct.
+You are also able to access any formdata or files that were sent
+with the request with the fields `.form` and `.files` respectively.
+
+For routes without URL parameters, arguments after `ctx` are populated by name from
+GET query values or POST form values. This also works for the `index` route at `/`.
+Missing values become empty strings, or zero values after conversion to integer or `bool`.
+
+```v ignore
+@['/forms'; post]
+pub fn (app &App) forms(mut ctx Context, value string) veb.Result {
+	return ctx.text(value)
+}
+```
+
+Posting `value=hello` as `application/x-www-form-urlencoded` to `/forms` passes `hello`
+to the handler.
+
+In the following example, visiting http://localhost:port/user?name=veb we
+will see the text `Hello veb!`. And if we access the route without the `name` parameter,
+http://localhost:port/user, we will see the text `no user was found`,
+
+**Example:**
+
+```v ignore
+@['/user'; get]
+pub fn (app &App) get_user_by_id(mut ctx Context) veb.Result {
+	user_name := ctx.query['name'] or {
+		// we can exit early and send a different response if no `name` parameter was passed
+		return ctx.text('no user was found')
+	}
+
+	return ctx.text('Hello ${user_name}!')
+}
+```
+
+### Request body size
+
+veb reads the whole request body into memory before it calls the route. A body can have up
+to `max_request_body_size` bytes, a field of `RunParams` that is 64 MiB by default. veb answers
+a request that has a larger body with `413`, and closes the connection. Raise the limit to
+accept larger uploads:
+
+```v ignore
+veb.run_at[App, Context](mut app,
+	port:                  8080
+	max_request_body_size: 512 * 1024 * 1024
+)!
+```
+
+`max_request_body_size: 0` removes the limit; use it only where every client is trusted.
+A negative value is an error. `max_request_buffer_size` is a different setting, which does
+not limit the body.
+
+The limit applies to both plain HTTP and HTTPS. Chunked bodies count the combined payload of
+all chunks. Invalid or overflowing `Content-Length` values and malformed chunk sizes are rejected
+with `400` before allocating their declared body; TLS reads also reject truncated bodies.
+Conflicting lengths and requests containing both `Transfer-Encoding` and `Content-Length`
+are rejected with `400`.
+
+To give some routes a lower limit, register `veb.body_limit` on them with `route_use`. It
+answers a larger body with `413` without closing the connection. It runs after veb has read
+the body, so it does not lower the memory that a request can use:
+
+```v ignore
+app.route_use('/api/profile', veb.body_limit[Context](100 * 1024))
+```
+
+### Host
+
+To restrict an endpoint to a specific host, you can use the `host` attribute
+followed by a colon `:` and the host name. You can test the Host feature locally
+by adding a host to the "hosts" file of your device.
+
+**Example:**
+
+```v ignore
+@['/'; host: 'example.com']
+pub fn (app &App) hello_web(mut ctx Context) veb.Result {
+	return ctx.text('Hello WEB')
+}
+
+@['/'; host: 'api.example.org']
+pub fn (app &App) hello_api(mut ctx Context) veb.Result {
+	return ctx.text('Hello API')
+}
+
+// define the handler without a host attribute last if you have conflicting paths.
+@['/']
+pub fn (app &App) hello_others(mut ctx Context) veb.Result {
+	return ctx.text('Hello Others')
+}
+```
+
+You can also [create a controller](#controller-with-hostname) to handle all requests from a specific
+host in one app struct.
+
+### Route Matching Order
+
+veb will match routes in the order that you define endpoints.
+
+**Example:**
+
+```v ignore
+@['/:path']
+pub fn (app &App) with_parameter(mut ctx Context, path string) veb.Result {
+	return ctx.text('from with_parameter, path: "${path}"')
+}
+
+@['/normal']
+pub fn (app &App) normal(mut ctx Context) veb.Result {
+	return ctx.text('from normal')
+}
+```
+
+In this example we defined an endpoint with a parameter first. If we access our app
+on the url http://localhost:port/normal we will not see `from normal`, but
+`from with_parameter, path: "normal"`.
+
+Routes with a variadic parameter such as `/:path...` are an exception. veb keeps
+them as fallbacks, so a later exact or non-variadic parameter route can still match
+before the variadic route handles the request.
+
+If the path matches a route for the request's host but the method does not, veb
+answers `405 Method Not Allowed`. Its `Allow` header lists the distinct methods
+from all handlers for the selected route pattern, including handlers whose path
+parameters use different names. Methods from other hosts or overlapping route
+patterns are excluded. A path with no matching route still answers `404 Not Found`.
+
+### Custom not found page
+
+You can implement a `not_found` endpoint that is called when a request is made, and no
+matching route is found to replace the default HTTP 404 not found page. This route
+has to be defined on our Context struct.
+
+**Example:**
+
+```v ignore
+pub fn (mut ctx Context) not_found() veb.Result {
+	// set HTTP status 404
+	ctx.res.set_status(.not_found)
+	return ctx.html('<h1>Page not found!</h1>')
+}
+```
+
+## Rendering without a server
+
+`veb.render_request[A, X](mut app, req)` dispatches an `http.Request` through the
+same routes, middleware, and registered controllers as the server, without opening
+a listener. It returns `!&veb.Context`: read the completed response from `ctx.res`.
+`X` must embed `veb.Context`.
+Context, route, and controller configuration errors are returned to the caller. Custom
+fields on `X` remain local to the handler; they are not part of the returned context.
+
+```v ignore
+ctx := veb.render_request[App, Context](mut app, http.Request{
+	method: .get
+	url: '/'
+})!
+os.write_file('index.html', ctx.res.body)!
+```
+
+Initialize static handlers and controllers before rendering, as before `veb.run`.
+Static file responses expose `ctx.return_file` and `ctx.return_type` instead of
+reading the file into `ctx.res.body`. Handlers that take over a connection require
+a real server connection and are unsuitable for this helper.
+
+See `examples/veb/static_export/` for an HTML export using the same page handlers
+as its preview server.
+
+## Static files and website
+
+veb also provides a way of handling static files. We can mount a folder at the root
+of our web app, or at a custom route. To start using static files we have to embed
+`veb.StaticHandler` on our app struct.
+
+**Example:**
+
+Let's say you have the following file structure:
+
+```
+.
+├── static/
+│   ├── css/
+│   │   └── main.css
+│   └── js/
+│       └── main.js
+└── main.v
+```
+
+If we want all the documents inside the `static` sub-directory to be publicly accessible, we can
+use `handle_static`.
+
+> **Note:**
+> veb will recursively search the folder you mount; all the files inside that folder
+> will be publicly available.
+
+_main.v_
+
+```v
+module main
+
+import veb
+
+pub struct Context {
+	veb.Context
+}
+
+pub struct App {
+	veb.StaticHandler
+}
+
+fn main() {
+	mut app := &App{}
+
+	app.handle_static('static', false)!
+
+	veb.run[App, Context](mut app, 8080)
+}
+```
+
+If we start the app with `v run main.v` we can access our `main.css` file at
+http://localhost:8080/static/css/main.css
+
+### Mounting folders at specific locations
+
+In the previous example the folder `static` was mounted at `/static`. We could also choose
+to mount the static folder at the root of our app: everything inside the `static` folder
+is available at `/`.
+
+**Example:**
+
+```v ignore
+// change the second argument to `true` to mount a folder at the app root
+app.handle_static('static', true)!
+```
+
+We can now access `main.css` directly at http://localhost:8080/css/main.css.
+
+If a request is made to the root of a static folder, veb will look for an
+`index.html` or `ìndex.htm` file and serve it if available.
+Thus, it's also a good way to host a complete website.
+An example is available [here](/examples/veb/static_website).
+
+It is also possible to mount the `static` folder at a custom path.
+
+**Example:**
+
+```v ignore
+// mount the folder 'static' at path '/public', the path has to start with '/'
+app.mount_static_folder_at('static', '/public')
+```
+
+If we run our app the `main.css` file is available at http://localhost:8080/public/main.css
+
+### Adding a single static asset
+
+If you don't want to mount an entire folder, but only a single file, you can use `serve_static`.
+
+**Example:**
+
+```v ignore
+// serve the `main.css` file at '/path/main.css'
+app.serve_static('/path/main.css',  'static/css/main.css')!
+```
+
+### Dealing with MIME types
+
+`ctx.file(path)` uses an explicit `ctx.content_type`, a custom MIME mapping, or the known
+file extension first. When none provides a type, it uses `http.detect_content_type` to
+inspect the beginning of the file. Unknown binary content is served as
+`application/octet-stream`. Sniffed HTML can run scripts from your origin; set an explicit
+safe content type when serving untrusted uploads. Static folder registration still requires
+extension mappings as described below.
+
+By default, veb will map the extension of a file to a MIME type. If any of your static file's
+extensions do not have a default MIME type in veb, veb will throw an error and you
+have to add your MIME type to `.static_mime_types` yourself.
+
+**Example:**
+
+Given the following file structure:
+
+```
+.
+├── static/
+│   └── file.what
+└── main.v
+```
+
+```v ignore
+app.handle_static('static', true)!
+```
+
+This code will throw an error, because veb has no default MIME type for a `.what` file extension.
+
+```
+unknown MIME type for file extension ".what"
+```
+
+To fix this we have to provide a MIME type for the `.what` file extension:
+
+```v ignore
+app.static_mime_types['.what'] = 'txt/plain'
+app.handle_static('static', true)!
+```
+
+### Compression for static files (zstd/gzip)
+
+veb provides automatic compression (zstd and gzip) for static files with smart caching.
+When enabled, veb will serve compressed versions of your static files to clients that
+support compression, reducing bandwidth usage and improving load times. Zstd is preferred
+over gzip when the client supports both.
+
+**How it works:**
+
+Static sidecars and generated compressed files honor case insensitive `Accept-Encoding` offers,
+wildcards, and `q=0` refusals. An explicit coding entry overrides the wildcard. If every enabled
+coding is refused or no header is sent, veb serves the original file.
+
+1. **Manual pre-compression**: If you create `.zst` or `.gz` files manually, veb will serve
+   them in zero-copy streaming mode for maximum performance when the MIME type is allowed.
+2. **Lazy compression cache**: Files smaller than the threshold are automatically compressed
+   on first request and cached under `os.cache_dir()/veb/static_compression/`
+   (zstd preferred when the client supports it). The source directory stays unchanged.
+3. **Cache validation**: If the original file is modified, the compressed cache is
+   automatically regenerated on the next request.
+4. **Streaming for large files**: Files larger than the threshold are served uncompressed in
+   streaming mode (unless a manual `.zst` or `.gz` file exists).
+
+**Example:**
+
+```v
+module main
+
+import veb
+
+pub struct Context {
+	veb.Context
+}
+
+pub struct App {
+	veb.StaticHandler
+	veb.Middleware[Context]
+}
+
+pub fn (mut app App) index(mut ctx Context) veb.Result {
+	return ctx.html('<h1>Compression demo</h1>
+    <p>Visit <a href="/app.js">/app.js</a> or <a href="/style.css">/style.css</a>
+    </p>')
+}
+
+fn main() {
+	mut app := &App{}
+
+	// Enable static file compression (zstd/gzip, disabled by default)
+	// Use enable_static_zstd and enable_static_gzip for specific compression
+	app.enable_static_compression = true
+	// Maximum file size for auto-compression is 512 KB (default: 1MB)
+	app.static_compression_max_size = 524288
+	app.static_compression_mime_types = [veb.mime_types['.css'], veb.mime_types['.js']]
+
+	// Serve files from the 'static' directory
+	app.handle_static('static', true)!
+
+	// Add the content encoding middleware to compress dynamic routes as well
+	// This will use zstd if the client supports it, otherwise gzip
+	// Use encode_gzip or encode_zstd for specific compression
+	app.use(veb.encode_auto[Context]())
+
+	veb.run[App, Context](mut app, 8080)
+}
+```
+
+Set `app.static_compression_mime_types` when you only want to compress specific static MIME
+types. Leave it empty to keep the current behavior and allow compression for any static file
+type.
+
+**Setup and testing:**
+
+Create test files in the `static` directory:
+```bash
+mkdir -p static
+echo "console.log('Hello from V web!');" > static/app.js
+echo "body { margin: 0; }" > static/style.css
+# Pre-compress style.css manually for zero-copy streaming (zstd or gzip)
+zstd -k static/style.css  # creates style.css.zst
+# or: gzip -k static/style.css  # creates style.css.gz
+```
+
+Run the server, it will listen on port 8080:
+```bash
+v run server.v
+```
+
+Test compression with cURL:
+```bash
+# Test zstd compression (preferred when client supports it)
+curl -H "Accept-Encoding: zstd, gzip" -i http://localhost:8080/app.js
+# Expected headers:
+# Content-Encoding: zstd
+# Vary: Accept-Encoding
+
+# Test gzip fallback (when client doesn't support zstd)
+curl -H "Accept-Encoding: gzip" -i http://localhost:8080/app.js
+# Expected headers:
+# Content-Encoding: gzip
+# Vary: Accept-Encoding
+
+# Request with automatic decompression
+curl -H "Accept-Encoding: zstd, gzip" --compressed http://localhost:8080/app.js
+
+# Request without encoding - should return uncompressed content
+curl -i http://localhost:8080/app.js
+
+# Auto-generated cache files are stored under:
+# os.cache_dir()/veb/static_compression/
+
+# Test manual pre-compression - style.css.zst is served directly (zero-copy)
+curl -H "Accept-Encoding: zstd" -i http://localhost:8080/style.css
+```
+
+**Performance tips:**
+
+- For production, you can pre-compress your static files with zstd (`zstd -k static/app.js`)
+  or gzip (`gzip -k static/app.js`) and veb will serve them directly without loading into memory.
+- Zstd offers better compression ratio and speed than gzip - use it when possible.
+
+**Priority order**: When both `.zst` and `.gz` files exist for the same source file, veb will
+serve `.zst` if the client supports zstd, otherwise `.gz` if gzip is supported.
+
+- The lazy cache is created on first request, so the first visitor pays a small
+  compression cost, but all subsequent requests are served at zero-copy speed.
+- Auto-generated cache files live in the OS cache directory, so read-only static
+  folders still work and your source tree stays clean.
+- Large files (> threshold) are always streamed, ensuring low memory usage even for large assets.
+- The `encode_auto` middleware automatically chooses zstd or gzip based on client support. You can
+  also use `encode_zstd` or `encode_gzip` for specific compression.
+  Dynamic compression skips bodies below 256 bytes, statuses without a body, streaming files,
+  already compressed content, and noncompressible media types. Compressed output is used only
+  when it is smaller. Encoding names are case insensitive; explicit `q=0` refusals override
+  wildcard offers. Repeated `Accept-Encoding` fields are combined before selecting a coding.
+  Positive quality values allow a coding; `encode_auto` prefers zstd over gzip.
+  Eligible responses include `Vary: Accept-Encoding` even when sent without compression, while
+  preserving existing `Vary` fields.
+  Compression weakens any existing strong ETag because the encoded bytes differ.
+- If caching fails (e.g., on read-only filesystems), veb automatically falls
+  back to serving compressed content from memory. You can set `static_compression_max_size = 0`
+  to disable auto-compression completely. For optimal performance on read-only systems,
+  pre-compress all files with `zstd -k` or `gzip -k`.
+
+### Markdown content negotiation
+
+veb can provide automatic content negotiation for markdown files, allowing you to serve
+markdown content when the client explicitly requests it via the `Accept` header.
+This is compliant to [llms.txt](https://llmstxt.org/) proposal and useful for documentations that
+can serve the same content in multiple formats, more efficiently to AI services using it.
+
+**How it works:**
+
+When `enable_markdown_negotiation` is enabled and a client sends `Accept: text/markdown`,
+veb will try to serve markdown variants in the following priority order:
+
+1. `path.md` - Direct markdown file
+2. `path.html.md` - HTML-flavored markdown (for content that can be rendered as both)
+3. `path/index.html.md` - Directory index in markdown format
+
+Without the `Accept: text/markdown` header, files are served normally based on their
+actual extension. This ensures backward compatibility - direct access to `.md` files
+always works regardless of the setting.
+
+**Example:**
+
+```v
+module main
+
+import veb
+
+pub struct Context {
+	veb.Context
+}
+
+pub struct App {
+	veb.StaticHandler
+}
+
+fn main() {
+	mut app := &App{}
+
+	// Enable markdown content negotiation (disabled by default)
+	app.enable_markdown_negotiation = true
+
+	// Serve files from the 'docs' directory
+	app.handle_static('docs', true)!
+
+	veb.run[App, Context](mut app, 8080)
+}
+```
+
+**Setup and testing:**
+
+Create test files in the `docs` directory:
+```bash
+mkdir -p docs
+echo "# API Documentation" > docs/api.md
+echo "# User Guide" > docs/guide.html.md
+echo "<h1>HTML Version</h1>" > docs/api.html
+```
+
+Run the server:
+```bash
+v run server.v
+```
+
+Test content negotiation with cURL:
+```bash
+# Request markdown version with content negotiation - serves api.md
+curl -H "Accept: text/markdown" http://localhost:8080/api
+
+# Direct access to .md file always works, regardless of Accept header
+curl http://localhost:8080/api.md
+
+# Direct access to .html file
+curl http://localhost:8080/api.html
+
+# Without Accept: text/markdown header - returns 404 since 'api' without extension doesn't exist
+curl http://localhost:8080/api
+```
+
+## Request activity hooks
+
+An application can implement `before_handle_request(req http.Request)` and
+`after_handle_request(req http.Request)` methods to account for request activity.
+These optional hooks surround both regular and TLS dispatch, including static
+files, routing errors and middleware that returns early. The after hook runs
+when dispatch returns, before the transport finishes writing the response.
+Applications without both methods keep their existing behavior.
+
+```v
+module main
+
+import net.http
+import veb
+
+pub struct Context {
+	veb.Context
+}
+
+pub struct App {
+	veb.Middleware[Context]
+}
+
+fn (mut app App) before_handle_request(req http.Request) {
+	// Begin process-wide activity accounting.
+}
+
+fn (mut app App) after_handle_request(req http.Request) {
+	// End activity accounting on every dispatch return path.
+}
+
+@['/']
+fn (mut app App) index(mut ctx Context) veb.Result { return ctx.text('Hello') }
+
+fn main() {
+	mut app := &App{}
+	veb.run[App, Context](mut app, 8080)
+}
+```
+
+For upgraded connections, account for message callbacks separately instead of
+keeping a request active for the entire lifetime of an idle connection.
+
+The hooks run on the dispatching worker. When workers handle requests concurrently,
+use synchronization for any shared counters or other application state. The after
+hook covers dispatch completion; a deferred `Context.after()` callback or an upgraded
+connection can continue after it returns.
+
+In ordinary Boehm GC builds, veb shares response bodies it owns with its private
+response writer and reuses one writer snapshot per fasthttp worker. Application
+contexts and their retained response aliases remain independent of that snapshot.
+Deferred responses receive an independent heap snapshot before a timer starts.
+Controller dispatch and nested use of a busy writer slot keep the allocating path.
+Other memory modes, including `-gc none`, `-prealloc`, autofree and ownership mode,
+keep the response-body copying path.
+
+## Middleware
+
+Middleware in web development is (loosely defined) a hidden layer that sits between
+what a user requests (the HTTP Request) and what a user sees (the HTTP Response).
+We can use this middleware layer to provide "hidden" functionality to our apps endpoints.
+
+To use veb's middleware we have to embed `veb.Middleware` on our app struct and provide
+the type of which context struct should be used.
+
+**Example:**
+
+```v ignore
+pub struct App {
+	veb.Middleware[Context]
+}
+```
+
+### Use case
+
+We could, for example, get the cookies for an HTTP request and check if the user has already
+accepted our cookie policy. Let's modify our Context struct to store whether the user has
+accepted our policy or not.
+
+**Example:**
+
+```v ignore
+pub struct Context {
+	veb.Context
+pub mut:
+	has_accepted_cookies bool
+}
+```
+
+In veb middleware functions take a `mut` parameter with the type of your context struct
+and must return `bool`. We have full access to modify our Context struct!
+
+Middleware handlers can also be bound methods, such as `app.session_middleware`.
+That lets middleware read or update fields on your app struct and reuse resources that
+live on it.
+
+The return value indicates to veb whether it can continue or has to stop. If we send a
+response to the client in a middleware function veb has to stop, so we return `false`.
+
+**Example:**
+
+```v ignore
+pub fn check_cookie_policy(mut ctx Context) bool {
+	// get the cookie
+	cookie_value := ctx.get_cookie('accepted_cookies') or { '' }
+	// check if the cookie has been set
+	if cookie_value == 'true' {
+		ctx.has_accepted_cookies = true
+	}
+	// we don't send a response, so we must return true
+	return true
+}
+```
+
+We can check this value in an endpoint and return a different response.
+
+**Example:**
+
+```v ignore
+@['/only-cookies']
+pub fn (app &App) only_cookie_route(mut ctx Context) veb.Result {
+	if ctx.has_accepted_cookies {
+		return ctx.text('Welcome!')
+	} else {
+		return ctx.text('You must accept the cookie policy!')
+	}
+}
+```
+
+There is one thing left for our middleware to work: we have to register our `only_cookie_route`
+function as middleware for our app. We must do this after the app is created and before the
+app is started.
+
+**Example:**
+
+```v ignore
+fn main() {
+	mut app := &App{}
+
+	// register middleware for all routes
+	app.use(handler: check_cookie_policy)
+
+	// Pass the App and context type and start the web server on port 8080
+	veb.run[App, Context](mut app, 8080)
+}
+```
+
+If your middleware needs access to app state or shared resources, register a bound
+method instead of a free function:
+
+```v ignore
+@[heap]
+pub struct App {
+	veb.Middleware[Context]
+mut:
+	request_count int
+}
+
+pub fn (mut app App) session_middleware(mut ctx Context) bool {
+	app.request_count++
+	ctx.res.header.add_custom('X-Request-Count', app.request_count.str()) or { return false }
+	return true
+}
+
+fn main() {
+	mut app := &App{}
+	app.use(handler: app.session_middleware)
+	app.route_use('/admin/:path...', handler: app.session_middleware)
+	veb.run[App, Context](mut app, 8080)
+}
+```
+
+### Types of middleware
+
+In the previous example we used so called "global" middleware. This type of middleware
+applies to every endpoint defined on our app struct; global. It is also possible
+to register middleware for only a certain route(s).
+
+**Example:**
+
+```v ignore
+// register middleware only for the route '/auth'
+app.route_use('/auth', handler: auth_middleware)
+// register middleware only for the route '/documents/' with a parameter
+// e.g. '/documents/5'
+app.route_use('/documents/:id')
+// register middleware with a parameter array. The middleware will be registered
+// for all routes that start with '/user/' e.g. '/user/profile/update'
+app.route_use('/user/:path...')
+// register middleware only for selected HTTP methods on a route
+app.route_use('/admin/auth', handler: auth_middleware, methods: [.get, .delete])
+```
+
+If `methods` is omitted, route middleware applies to all HTTP methods on that route.
+
+### CORS header allow-lists
+
+`veb.CorsOptions.allowed_headers` names the CORS request headers that the application accepts,
+such as `X-Token` and `Content-Type`. Validation compares these names case-insensitively with
+the comma-separated `Access-Control-Request-Headers` value. The `origins` option validates
+the browser's `Origin` header separately. Normal browser headers such as `User-Agent` can
+therefore accompany a request when an application header allow-list is configured.
+
+### Evaluation moment
+
+By default, the registered middleware functions are executed *before* a method on your
+app struct is called. You can also change this behaviour to execute middleware functions
+*after* a method on your app struct is called, but before the response is sent!
+
+**Example:**
+
+```v ignore
+pub fn modify_headers(mut ctx Context) bool {
+	// add Content-Language: 'en-US' header to each response
+	ctx.res.header.add(.content_language, 'en-US')
+	return true
+}
+```
+
+```v ignore
+app.use(handler: modify_headers, after: true)
+```
+
+#### When to use which type
+
+You could use "before" middleware to check and modify the HTTP request and you could use
+"after" middleware to validate the HTTP response that will be sent or do some cleanup.
+
+Anything you can do in "before" middleware, you can do in "after" middleware.
+
+### Evaluation order
+
+veb will handle requests in the following order:
+
+1. Execute global "before" middleware
+2. Execute "before" middleware that matches the requested route
+3. Execute the endpoint handler on your app struct
+4. Execute global "after" middleware
+5. Execute "after" middleware that matches the requested route
+
+In each step, except for step `3`, veb will evaluate the middleware in the order that
+they are registered; when you call `app.use` or `app.route_use`.
+
+### Early exit
+
+If any middleware sends a response (and thus must return `false`) veb will not execute any
+other middleware, or the endpoint method, and immediately send the response.
+
+**Example:**
+
+```v ignore
+pub fn early_exit(mut ctx Context) bool {
+	ctx.text('early exit')
+	// we send a response from middleware, so we have to return false
+	return false
+}
+
+pub fn logger(mut ctx Context) bool {
+	println('received request for "${ctx.req.url}"')
+	return true
+}
+```
+
+```v ignore
+app.use(handler: early_exit)
+app.use(handler: logger)
+```
+
+Because we register `early_exit` before `logger` our logging middleware will never be executed!
+
+### Limiting concurrent requests
+
+`veb.throttle` caps how many requests run their handlers at once. A request over the cap
+waits for a free slot; when `max_waiting` requests are already waiting, or the wait passes
+`wait_timeout`, it is refused with `503 Service Unavailable` and a `Retry-After` header.
+
+```v ignore
+th := veb.throttle[Context](max_concurrent: 8, max_waiting: 16, wait_timeout: 2 * time.second)
+// register it after middleware that refuses requests cheaply, such as authentication
+app.use(th.acquire())
+// or only for some routes; every registration of `th` shares the same cap
+app.route_use('/reports/:path...', th.acquire())
+```
+
+The middleware takes a slot, and veb frees it when the request finishes, whichever way it
+finishes: after the handler and the "after" middleware, on a 404, or when a later middleware
+refuses the request. There is nothing to register for the release.
+
+A waiting request sleeps on the thread that serves it. veb serves each connection inline on
+a fixed set of worker threads, so a waiting request also delays the other connections of its
+thread, and no more requests than there are worker threads run handlers at once. Keep
+`max_concurrent` below the worker count for the cap to matter, and use `max_waiting: 0` to
+refuse at once instead of queueing.
+
+## Controllers
+
+Controllers can be used to split up your app logic so you are able to have one struct
+per "route group". E.g. a struct `Admin` for urls starting with `'/admin'` and a struct `Foo`
+for urls starting with `'/foo'`.
+
+To use controllers we have to embed `veb.Controller` on
+our app struct and when we register a controller we also have to specify
+what the type of the context struct will be. That means that it is possible
+to have a different context struct for each controller and the main app struct.
+
+**Example:**
+
+```v
+module main
+
+import veb
+
+pub struct Context {
+	veb.Context
+}
+
+pub struct App {
+	veb.Controller
+}
+
+// this endpoint will be available at '/'
+pub fn (app &App) index(mut ctx Context) veb.Result {
+	return ctx.text('from app')
+}
+
+pub struct Admin {}
+
+// this endpoint will be available at '/admin/'
+pub fn (app &Admin) index(mut ctx Context) veb.Result {
+	return ctx.text('from admin')
+}
+
+pub struct Foo {}
+
+// this endpoint will be available at '/foo/'
+pub fn (app &Foo) index(mut ctx Context) veb.Result {
+	return ctx.text('from foo')
+}
+
+fn main() {
+	mut app := &App{}
+
+	// register the controllers the same way as how we start a veb app
+	mut admin_app := &Admin{}
+	app.register_controller[Admin, Context]('/admin', mut admin_app)!
+
+	mut foo_app := &Foo{}
+	app.register_controller[Foo, Context]('/foo', mut foo_app)!
+
+	veb.run[App, Context](mut app, 8080)
+}
+```
+
+You can do everything with a controller struct as with a regular `App` struct.
+Register middleware, add static files and you can even register other controllers!
+Static assets registered on either the main app or a controller keep working when
+controllers are mounted, including controllers mounted at `'/'`.
+
+### Routing
+
+Any route inside a controller struct is treated as a relative route to its controller namespace.
+
+```v ignore
+@['/path']
+pub fn (app &Admin) path(mut ctx Context) veb.Result {
+    return ctx.text('Admin')
+}
+```
+
+When we registered the controller with
+`app.register_controller[Admin, Context]('/admin', mut admin_app)!`
+we told veb that the namespace of that controller is `'/admin'` so in this example we would
+see the text "Admin" if we navigate to the url `'/admin/path'`.
+
+veb doesn't support duplicate routes, so if we add the following
+route to the example the code will produce an error.
+
+```v ignore
+@['/admin/path']
+pub fn (app &App) admin_path(mut ctx Context) veb.Result {
+    return ctx.text('Admin overwrite')
+}
+```
+
+There will be an error, because the controller `Admin` handles all routes starting with
+`'/admin'`: the endpoint `admin_path` is unreachable.
+
+### Controller with hostname
+
+You can also set a host for a controller. All requests coming to that host will be handled
+by the controller.
+
+**Example:**
+
+```v ignore
+struct Example {}
+
+// You can only access this route at example.com: http://example.com/
+pub fn (app &Example) index(mut ctx Context) veb.Result {
+	return ctx.text('Example')
+}
+```
+
+```v ignore
+mut example_app := &Example{}
+// set the controllers hostname to 'example.com' and handle all routes starting with '/',
+// we handle requests with any route to 'example.com'
+app.register_host_controller[Example, Context]('example.com', '/', mut example_app)!
+```
+
+## Context Methods
+
+veb has a number of utility methods that make it easier to handle requests and send responses.
+These methods are available on `veb.Context` and directly on your own context struct if you
+embed `veb.Context`. Below are some of the most used methods, look at the
+[standard library documentation](https://modules.vlang.io/) to see them all.
+
+### Request methods
+
+You can directly access the HTTP request on the `.req` field.
+
+#### Get the client IP address
+
+`ctx.ip()` returns the socket peer's IP address by default. Forwarding headers from direct
+clients are ignored. To accept them from your reverse proxies, declare their IP addresses on
+the app:
+
+```v ignore
+pub struct App {
+	trusted_proxies []string = ['10.0.0.1', '10.0.0.2']
+}
+```
+
+Only list proxies you control and configure to append the actual peer to `X-Forwarded-For`.
+Addresses must be individual IPv4 or IPv6 literals; CIDR ranges are not supported.
+When the socket peer is trusted, `ip()` combines all `X-Forwarded-For` fields in their received
+order and walks the chain from right to left, stopping at the nearest untrusted address.
+For example, trusted peer `10.0.0.2` with `203.0.113.66, 198.51.100.9, 10.0.0.1` returns
+`198.51.100.9`: an earlier prefix supplied by that client cannot choose its identity.
+If every hop is trusted, the left-most address is returned. Empty or malformed entries stop
+the walk at the last trusted hop, and IPv6 addresses are returned in canonical form.
+
+Only when `X-Forwarded-For` is absent may a trusted peer supply `CF-Connecting-IP`, followed
+by `X-Real-Ip`. These must contain a single valid IP address. Configure trusted proxies to
+overwrite or remove these headers from untrusted clients, since they carry no proxy chain.
+An empty or malformed `X-Forwarded-For` never falls back to these headers.
+
+#### Get request headers
+
+**Example:**
+
+```v ignore
+pub fn (app &App) index(mut ctx Context) veb.Result {
+	content_length := ctx.get_header(.content_length) or { '0' }
+	// get custom header
+	custom_header := ctx.get_custom_header('X-HEADER') or { '' }
+	// ...
+}
+```
+
+A request can have up to `http.max_headers` (50) header fields. veb answers a request
+that has more with `431 Request Header Fields Too Large`, and closes the connection.
+
+#### Get a cookie
+
+**Example:**
+
+```v ignore
+pub fn (app &App) index(mut ctx Context) veb.Result {
+	cookie_val := ctx.get_cookie('token') or { '' }
+	// ...
+}
+```
+
+### Response methods
+
+You can directly modify the HTTP response by changing the `res` field,
+which is of the type `http.Response`.
+
+#### Send response with different MIME types
+
+```v ignore
+// send response HTTP_OK with content-type `text/html`
+ctx.html('<h1>Hello world!</h1>')
+// send response HTTP_OK with content-type `text/plain`
+ctx.text('Hello world!')
+// stringify the object and send response HTTP_OK with content-type `application/json`
+ctx.json(User{
+	name: 'test'
+	age: 20
+})
+// send response HTTP_NO_CONTENT (204) without a content-type and body
+ctx.no_content()
+```
+
+#### Reusing a JSON buffer
+
+`ctx.json_buf(value, mut buffer)` produces the same response as `ctx.json(value)`, while
+reusing a caller-owned `[]u8` for intermediate encoding. It clears the buffer first and
+copies the result into the response, so the buffer can be reused as soon as the call returns.
+
+```v ignore
+mut buffer := []u8{cap: 2048}
+ctx.json_buf(User{name: 'test', age: 20}, mut buffer)
+```
+
+For encoding without sending a response, `veb.json_encode_into(value, mut buffer)` appends
+JSON to the buffer; call `buffer.clear()` first when replacing its previous contents.
+Keep reusable buffers local to a request worker or borrow them exclusively from a pool.
+Concurrent requests must not encode into the same buffer at the same time.
+
+#### Sending files
+
+**Example:**
+
+```v ignore
+pub fn (app &App) file_response(mut ctx Context) veb.Result {
+	// send the file 'image.png' in folder 'data' to the user
+	return ctx.file('data/image.png')
+}
+```
+
+#### Set response headers
+
+**Example:**
+
+```v ignore
+pub fn (app &App) index(mut ctx Context) veb.Result {
+	ctx.set_header(.accept, 'text/html')
+	// set custom header
+	ctx.set_custom_header('X-HEADER', 'my-value')!
+	// ...
+}
+```
+
+#### Set a cookie
+
+**Example:**
+
+```v ignore
+pub fn (app &App) index(mut ctx Context) veb.Result {
+	ctx.set_cookie(http.Cookie{
+		name: 'token'
+		value: 'true'
+		path: '/'
+		secure: true
+		http_only: true
+	})
+	// ...
+}
+```
+
+#### Redirect
+
+You must pass the type of redirect to veb:
+
+- `moved_permanently` HTTP code 301
+- `found` HTTP code 302
+- `see_other` HTTP code 303
+- `temporary_redirect` HTTP code 307
+- `permanent_redirect` HTTP code 308
+
+**Common use cases:**
+
+If you want to change the request method, for example when you receive a post request and
+want to redirect to another page via a GET request, you should use `see_other`. If you want
+the HTTP method to stay the same, you should use `found` generally speaking.
+
+**Example:**
+
+```v ignore
+pub fn (app &App) index(mut ctx Context) veb.Result {
+	token := ctx.get_cookie('token') or { '' }
+	if token == '' {
+		// redirect the user to '/login' if the 'token' cookie is not set
+		// we explicitly tell the browser to send a GET request
+		return ctx.redirect('/login', typ: .see_other)
+	} else {
+		return ctx.text('Welcome!')
+	}
+}
+```
+
+#### Sending error responses
+
+**Example:**
+
+```v ignore
+pub fn (app &App) login(mut ctx Context) veb.Result {
+	if username := ctx.form['username'] {
+		return ctx.text('Hello "${username}"')
+	} else {
+		// send an HTTP 400 Bad Request response with a message
+		return ctx.request_error('missing form value "username"')
+	}
+}
+```
+
+You can also use `ctx.server_error(msg string)` to send an HTTP 500 internal server
+error with a message.
+
+If a handler panics, veb logs the panic and responds with HTTP 500 and the plain-text
+body `Internal Server Error`. This replaces any prepared body or file response and
+its content, framing, and cache metadata. After-middleware is skipped. A connection
+taken over with `ctx.takeover_conn()` or `ctx.takeover_conn_reusable()` remains under
+the handler's control; recovery does not write another response to it.
+
+## Handlers that return `!veb.Result`
+
+A handler that can fail may return `!veb.Result` instead of rolling its own
+error responses. Answer by returning the value, decline by returning an error,
+and veb turns the error into a JSON envelope carrying its message. When the
+handler already chose a status with `ctx.res.set_status`, it is kept, so 4xx
+stays in the handler's hands; otherwise the envelope is a 500.
+
+**Example:**
+
+```v
+module main
+
+import veb
+
+pub struct Context {
+	veb.Context
+}
+
+pub struct App {}
+
+fn user_name_by_id(id int) !string {
+	if id != 42 {
+		return error('no such user')
+	}
+	return 'douglas'
+}
+
+@['/user/:id']
+pub fn (app &App) user(mut ctx Context, id int) !veb.Result {
+	// A status the handler chose is kept, so `return error(...)` here answers
+	// 404 with a JSON envelope carrying the message.
+	name := user_name_by_id(id) or {
+		ctx.res.set_status(.not_found)
+		return error('no user with id ${id}')
+	}
+	return ctx.text('Hello ${name}!')
+}
+```
+
+## Advanced usage
+
+If you need more control over the TCP connection with a client, for example when
+you want to keep the connection open. You can call `ctx.takeover_conn`.
+
+When this function is called you are free to do anything you want with the TCP
+connection and veb will not interfere. This means that we are responsible for
+sending a response over the connection and closing it.
+
+### Empty Result
+
+Sometimes you want to send the response in another thread, for example when using
+[Server Sent Events](sse/README.md). When you are sure that a response will be sent
+over the TCP connection you can return `veb.no_result()`. This function does nothing
+and returns an empty `veb.Result` struct, letting veb know that we sent a response ourselves.
+
+> **Note:**
+> It is important to call `ctx.takeover_conn` before you spawn a thread
+
+**Example:**
+
+```v
+module main
+
+import net
+import time
+import veb
+
+pub struct Context {
+	veb.Context
+}
+
+pub struct App {}
+
+pub fn (app &App) index(mut ctx Context) veb.Result {
+	return ctx.text('hello!')
+}
+
+@['/long']
+pub fn (app &App) long_response(mut ctx Context) veb.Result {
+	// let veb know that the connection should not be closed
+	ctx.takeover_conn()
+	// use spawn to handle the connection in another thread
+	// if we don't the whole web server will block for 10 seconds,
+	// since veb is singlethreaded
+	spawn handle_connection(mut ctx.conn)
+	// we will send a custom response ourselves, so we can safely return an empty result
+	return veb.no_result()
+}
+
+fn handle_connection(mut conn net.TcpConn) {
+	defer {
+		conn.close() or {}
+	}
+	// block for 10 second
+	time.sleep(time.second * 10)
+	conn.write_string('HTTP/1.1 200 OK\r\nContent-type: text/html\r\nContent-length: 15\r\n\r\nHello takeover!') or {}
+}
+
+fn main() {
+	mut app := &App{}
+	veb.run[App, Context](mut app, 8080)
+}
+```
+
+### Deferred responses
+
+A handler that needs to answer later, without holding the worker, returns
+`ctx.after(ms, cb, arg)`. The handler returns at once; no sooner than `ms`
+milliseconds on, `cb` runs and writes the single response. `ms <= 0` runs
+`cb` on the next timer turn. `cb` may call `after` again to re-arm the
+timer; otherwise the connection closes once `cb` returns.
+
+```v
+module main
+
+import veb
+
+pub struct Context {
+	veb.Context
+}
+
+pub struct App {}
+
+fn done(mut ctx veb.Context, arg u64) {
+	ctx.text('late:${arg}')
+}
+
+@['/delay/:ms']
+pub fn (mut app App) delay(mut ctx Context, ms int) veb.Result {
+	return ctx.after(ms, done, u64(ms))
+}
+
+fn main() {
+	mut app := &App{}
+	veb.run[App, Context](mut app, 8080)
+}
+```
+
+Boundaries, compared with a plain handler:
+
+* `cb` runs on a dedicated timer thread, not the accept-loop worker, and
+  receives the base `Context`, not the app's wrapper type. The request is
+  still readable, but app state must travel in `arg`.
+* The timer closes the connection after the response and advertises
+  `Connection: close`, so do not pipeline another request behind a
+  deferred one. After-middleware is skipped for deferred responses.
+* Without a live client transport (unit tests, `render_request`, the SSL
+  path, which has no takeover support) `after` answers inline instead:
+  the response and its timing stay correct, on the caller's thread.
+
+## Conditional static responses and ranges
+
+Identity responses from `Context.file` and `StaticHandler` include a strong `ETag`,
+`Last-Modified`, and `Accept-Ranges: bytes`. The ETag hashes the file contents with SHA-256,
+reading the file in bounded chunks on every request, even when its body is streamed. Files that
+change within one timestamp second still receive different ETags. `Last-Modified` has HTTP's
+second precision; prefer ETags for files that can change more frequently.
+
+`If-None-Match` combines all repeated fields. Its presence takes precedence over
+`If-Modified-Since`, including an empty list of tags.
+A match returns 304 for GET and HEAD,
+without a body or Content-Length, and 412 for other methods. `If-Modified-Since` is ignored for
+other methods. Identity responses retain `Vary: Accept-Encoding` along with
+existing Vary fields. Encoded static responses currently omit these validators, so an identity
+ETag cannot suppress a compressed body. `If-None-Match: *` still matches an existing encoded
+representation, returning 304 for GET/HEAD or 412 for other methods. Its 304 omits the identity
+ETag.
+A takeover-mode 304 uses a weak ETag to preserve
+validators for bodies encoded by dynamic middleware. That weak tag can revalidate a cached body;
+a later `If-Range` request with it falls back to the full response.
+
+In-memory takeover GET responses support one byte range (`bytes=0-99`, `bytes=100-`, or
+`bytes=-100`). Range headers on other methods are ignored.
+A satisfiable range returns 206 and `Content-Range`; an out-of-bounds range returns 416. Invalid
+or multiple ranges are ignored. `If-Range` requires an exact strong ETag. Weak ETags, stale
+validators, and date validators fall back to the full response: filesystem dates have only second
+precision and cannot prove the file was unchanged within that second. Streaming transports serve
+the full 200 response for ranges because their file writers do not support offsets.
+
+## In-process raw HTTP requests
+
+`veb.handle_raw[App, Context](mut app, request_bytes)` parses raw HTTP/1 request bytes and
+runs the normal dispatcher without opening a socket. It returns complete serialized responses,
+including file bodies. Pipelined requests produce concatenated responses in request order until
+EOF, a parse error, or `Connection: close`. Parse errors produce the corresponding HTTP error;
+invalid route configuration produces HTTP 500. A file that cannot be read while serializing also
+produces HTTP 500 and ends processing.
+
+This helper buffers requests and responses in memory, including static files. Use it for in-process
+wire-parser and routing tests. Socket takeover, live SSE streams, and WebSocket connections require
+a network transport. For an already parsed `http.Request`, use `veb.render_request` instead.

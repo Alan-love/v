@@ -1,85 +1,932 @@
 module main
 
 import os
-import os.cmdline
 import v.pref
 import v.util.recompilation
+import v.util.vflags
 
-const is_debug = os.args.contains('-debug')
+const args_ = arguments()
+const is_debug = args_.contains('-debug')
+const full_v_cli_source = 'cmd/v'
+const standalone_v3_source = 'vlib/v/v.v'
+
+// support a renamed `v` executable too:
+const vexe = os.getenv_opt('VEXE') or { @VEXE }
+
+const vroot = os.dir(vexe)
 
 fn main() {
-	vexe := pref.vexe_path()
-	vroot := os.dir(vexe)
-	recompilation.must_be_enabled(vroot, 'Please install V from source, to use `v self` .')
-	os.chdir(vroot)
+	// make testing `v up` easier, by providing a way to force `v self` to fail,
+	// to test the fallback logic:
+	if os.getenv('VSELF_SHOULD_FAIL') != '' {
+		eprintln('v self failed')
+		exit(1)
+	}
+	vexe_name := os.file_name(vexe)
+	short_v_name := vexe_name.all_before('.')
+
+	recompilation.must_be_enabled(vroot, 'Please install V from source, to use `${vexe_name} self` .')
+	os.chdir(vroot)!
 	os.setenv('VCOLORS', 'always', true)
-	args := os.args[1..].filter(it != 'self')
-	jargs := args.join(' ')
-	obinary := cmdline.option(args, '-o', '')
-	sargs := if obinary != '' { jargs } else { '$jargs -o v2' }
-	cmd := '$vexe $sargs cmd/v'
-	options := if args.len > 0 { '($sargs)' } else { '' }
-	println('V self compiling ${options}...')
-	compile(vroot, cmd)
+	host_os := self_build_host_os()
+	command_index := os.getenv('VSELF_COMMAND_INDEX').int()
+	os.unsetenv('VSELF_COMMAND_INDEX')
+	repeat_count, mut args := extract_repeat_count(args_[1..], command_index)
+	mut effective_args := effective_self_build_args(args)
+	self_backend := self_build_backend(effective_args)
+	fastc_self_build := self_backend == 'fastc'
+	arm64_self_build := self_backend == 'arm64'
+	c_self_build := self_backend == 'c'
+	if c_self_build && '-prod' in effective_args && self_build_trains_fastc(effective_args) {
+		// A lazy backend is built without optimization. Production compilers must
+		// carry FastC themselves so both Clang optimization and PGO cover it.
+		args << ['-compile-backend', 'fastc']
+		effective_args = effective_self_build_args(args)
+	}
+	if fastc_self_build && '-prod' in effective_args {
+		eprintln('`v self -b fastc` does not support `-prod`; remove `-prod`.')
+		exit(1)
+	}
+	if fastc_self_build {
+		args = normalize_fastc_backend_args(args)
+		effective_args = effective_self_build_args(args)
+	}
+	if c_self_build && !has_self_build_configuration_arg(effective_args) {
+		// compiling by default, i.e. `v self`:
+		unam := os.uname()
+		if host_os == 'macos' {
+			// The bundled TCC is much faster for compiler rebuilds. The
+			// generated compiler uses pthread-backed allocator state because native
+			// TinyCC TLS is not reliable on macOS.
+			args << ['-cc', os.getenv_opt('CC') or { 'tcc' }]
+		} else if host_os == 'linux'
+			&& (unam.machine in ['arm64', 'aarch64'] || pref.host_arch() == 'arm32') {
+			// Bundled TCC can hang while bootstrapping V on Linux ARM64, so
+			// prefer the system compiler for self-builds there. On 32-bit ARM, the
+			// compiler that TCC links crashes at startup: the Thumb-2 C startup code
+			// cannot reach libc across V's text, and TCC adds no veneer.
+			args << ['-cc', os.getenv_opt('CC') or { 'cc' }]
+		} else if host_os in ['freebsd', 'openbsd', 'netbsd', 'dragonfly'] {
+			// Keep the ordinary BSD self-build on the platform's system toolchain.
+			// Explicit TinyCC builds use the preallocation-compatible pthread slot.
+			args << ['-cc', os.getenv_opt('CC') or { 'cc' }]
+		}
+	}
+	if !has_gc_arg(effective_args) {
+		args << ['-gc', 'none']
+	}
+	if c_self_build {
+		// Older host compilers keep optional cmd/v backends by default. Prune them
+		// explicitly so the first rebuild already produces the small compiler.
+		args << self_build_backend_skips(effective_args)
+	}
+	effective_args = effective_self_build_args(args)
+	if !fastc_self_build && ('-prod' in effective_args || arm64_self_build)
+		&& (!arm64_self_build
+			|| ('-memory-limit' !in effective_args && '--memory-limit' !in effective_args))
+		&& '-no-memory-limit' !in effective_args
+		&& '--no-memory-limit' !in effective_args {
+		// Production C generation and native compiler rebuilds without allocation
+		// arenas can exceed the default process limit.
+		args << '-no-memory-limit'
+	}
+	effective_args = effective_self_build_args(args)
+	if c_self_build && self_build_supports_prealloc(effective_args, host_os)
+		&& !has_prealloc_arg(effective_args) {
+		// The embedded V3 compiler uses disposable preallocation scopes. Pass the
+		// flag explicitly so the first `v up` built by an older compiler gets
+		// the bounded-memory implementation too.
+		args << '-prealloc'
+	}
+	// A replacement compiler has to be built entirely from the checked-out sources.
+	// Reusing a whole-program cache entry here can carry stale checker/codegen state
+	// from the compiler that is being replaced into a binary that reports the new hash.
+	effective_args = effective_self_build_args(args)
+	if '-nocache' !in effective_args && '--no-cache' !in effective_args {
+		args << '-nocache'
+		effective_args = effective_self_build_args(args)
+	}
+	obinary := self_build_output(args)
+	if fastc_self_build && repeat_count > 1 && obinary == '' {
+		unsupported := unsupported_fastc_repeat_args(args)
+		if unsupported.len > 0 {
+			eprintln('`v self -b fastc xN` cannot preserve these options across repeated replacement builds: ${unsupported.join(' ')}')
+			eprintln('Remove the options, use `x1`, or specify `-o` to keep the original compiler.')
+			exit(1)
+		}
+	}
+	mut compile_args := clone_args(args)
+	if obinary == '' {
+		compile_args << ['-o', 'v2']
+	}
+	if fastc_self_build {
+		compile_args << '-selfhost'
+	}
+	final_binary := if obinary != '' { obinary } else { 'v2' }
+	// Train Clang production compilers on self-compilation. Ordinary rebuilds and
+	// explicitly parallel C builds keep the single-build path; other C toolchains
+	// retain it until their profile generation and reuse are validated too.
+	pgo_cc_kind := if c_self_build && pgo_compiler_kind(effective_args) == 'clang' {
+		'clang'
+	} else {
+		''
+	}
+	// Only explicit FastC builds are standalone. Regular replacements must retain
+	// cmd/v so commands such as self, up, fmt, and version remain available.
+	compilation_source := if fastc_self_build { standalone_v3_source } else { full_v_cli_source }
+	for run_idx in 0 .. repeat_count {
+		run_label := if repeat_count > 1 { ' [${run_idx + 1}/${repeat_count}]' } else { '' }
+		options := if args.len > 0 { '(${compile_args.join(' ')})' } else { '' }
+		println('V self compiling${run_label} ${options}...')
+		cmd := compose_v_cmd(vexe, compile_args, compilation_source)
+		mut used_pgo := false
+		if pgo_cc_kind != '' {
+			used_pgo = compile_with_pgo(vroot, vexe, args, final_binary, pgo_cc_kind)
+			if !used_pgo {
+				eprintln('PGO self-build failed; falling back to a regular self-build.')
+			}
+		}
+		if fastc_self_build || arm64_self_build {
+			// Native self-build failures must retain the backend diagnostic. Retrying
+			// through the portable C bootstrap cannot validate native self-hosting.
+			run_cmd(cmd) or {
+				eprintln('cannot compile to `${vroot}`: \n${err.msg()}')
+				exit(1)
+			}
+		} else if !used_pgo {
+			if !try_compile(cmd) {
+				bootstrap_self_build(vroot, clone_args(args), final_binary) or {
+					eprintln('cannot compile to `${vroot}`: \n${err.msg()}')
+					exit(1)
+				}
+			}
+		}
+		if obinary == '' {
+			backup_old_version_and_rename_newer(short_v_name) or { panic(err.msg()) }
+		}
+	}
 	if obinary != '' {
-		// When -o was given, there is no need to backup/rename the original.
-		// The user just wants an independent copy of v, and so we are done.
 		return
 	}
-	backup_old_version_and_rename_newer() or { panic(err.msg) }
-	println('V built successfully!')
+	println('V built successfully as executable "${vexe_name}".')
 }
 
-fn compile(vroot string, cmd string) {
-	result := os.execute_or_exit(cmd)
+fn self_build_output(args []string) string {
+	mut output := ''
+	mut i := 0
+	for i < args.len {
+		arg := args[i]
+		if arg in ['-o', '-output'] && i + 1 < args.len {
+			output = args[i + 1]
+			i += 2
+			continue
+		}
+		if (arg == '-cf' || pref.option_may_consume_value(arg)) && i + 1 < args.len {
+			i += 2
+		} else {
+			i++
+		}
+	}
+	return output
+}
+
+fn self_build_backend(args []string) string {
+	mut backend := 'c'
+	mut target_arch := pref.host_arch()
+	mut i := 0
+	for i < args.len {
+		arg := args[i]
+		if arg in ['-b', '-backend'] && i + 1 < args.len {
+			backend = args[i + 1]
+			i += 2
+			continue
+		}
+		if arg == '-arch' && i + 1 < args.len {
+			target_arch = args[i + 1]
+			i += 2
+			continue
+		}
+		if arg == '-native' {
+			backend = 'native'
+		} else if arg.starts_with('-b=') || arg.starts_with('-backend=') {
+			backend = arg.all_after('=')
+		}
+		if (arg == '-cf' || pref.option_may_consume_value(arg)) && i + 1 < args.len {
+			i += 2
+		} else {
+			i++
+		}
+	}
+	return if backend == 'native' { pref.native_backend_for_arch(target_arch) } else { backend }
+}
+
+fn self_build_backend_skips(args []string) []string {
+	mut included := [self_build_backend(args)]
+	mut i := 0
+	for i < args.len {
+		arg := args[i]
+		if arg in ['-all-backends', '--all-backends'] {
+			return []
+		}
+		if arg in ['-compile-backend', '--compile-backend'] && i + 1 < args.len {
+			included << args[i + 1].split(',').map(it.trim_space())
+			i += 2
+			continue
+		}
+		if (arg == '-cf' || pref.option_may_consume_value(arg)) && i + 1 < args.len {
+			i += 2
+		} else {
+			i++
+		}
+	}
+	mut skips := []string{}
+	mut needs_ssa := false
+	for backend, aliases in {
+		'fastc': ['fastc']
+		'arm64': ['arm64', 'aarch64']
+		'amd64': ['amd64', 'x64', 'x86_64', 'x86-64']
+		'wasm':  ['wasm', 'wasm32']
+		'eval':  ['eval']
+	} {
+		if aliases.any(it in included) {
+			if backend in ['arm64', 'amd64', 'wasm'] {
+				needs_ssa = true
+			}
+			continue
+		}
+		skips << ['-d', 'skip_${backend}']
+		if backend == 'amd64' {
+			// A newer bootstrap compiler can still be rebuilding pre-rename source.
+			skips << ['-d', 'skip_x64']
+		}
+	}
+	if !needs_ssa {
+		skips << ['-d', 'skip_ssa']
+	}
+	return skips
+}
+
+fn normalize_fastc_backend_args(args []string) []string {
+	mut normalized := []string{cap: args.len}
+	mut i := 0
+	for i < args.len {
+		arg := args[i]
+		if arg in ['-b', '-backend'] && i + 1 < args.len {
+			i += 2
+			continue
+		}
+		if arg == '-native' || arg.starts_with('-b=') || arg.starts_with('-backend=') {
+			i++
+			continue
+		}
+		normalized << arg
+		if (arg == '-cf' || pref.option_may_consume_value(arg)) && i + 1 < args.len {
+			normalized << args[i + 1]
+			i += 2
+		} else {
+			i++
+		}
+	}
+	normalized << ['-b', 'fastc']
+	return normalized
+}
+
+fn unsupported_fastc_repeat_args(args []string) []string {
+	mut unsupported := []string{}
+	mut i := 0
+	for i < args.len {
+		arg := args[i]
+		if arg in ['-b', '-gc'] && i + 1 < args.len {
+			value := args[i + 1]
+			supported := match arg {
+				'-b' { value == 'fastc' }
+				'-gc' { value == 'none' }
+				else { false }
+			}
+
+			if !supported {
+				unsupported << '${arg} ${value}'
+			}
+			i += 2
+			continue
+		}
+		if arg in ['-silent', '-keepc', '-nocache'] {
+			i++
+			continue
+		}
+		mut option := arg
+		if (arg == '-cf' || pref.option_may_consume_value(arg)) && i + 1 < args.len {
+			option += ' ${args[i + 1]}'
+			i += 2
+		} else {
+			i++
+		}
+		unsupported << option
+	}
+	return unsupported
+}
+
+fn effective_self_build_args(args []string) []string {
+	mut effective_args := vflags.tokenize_to_args(os.getenv('VFLAGS'))
+	effective_args << args
+	return effective_args
+}
+
+fn has_self_build_configuration_arg(args []string) bool {
+	for arg in args {
+		if arg in ['-cc', '-prod', '-parallel-cc'] || arg.starts_with('-cc=')
+			|| arg.starts_with('-cc ') {
+			return true
+		}
+	}
+	return false
+}
+
+fn repeat_count_arg(arg string) int {
+	if arg.len < 2 || arg[0] != `x` {
+		return 0
+	}
+	for ch in arg[1..].bytes() {
+		if !ch.is_digit() {
+			return 0
+		}
+	}
+	count := arg[1..].int()
+	return if count > 0 { count } else { 0 }
+}
+
+fn extract_repeat_count(args []string, protected_prefix_count int) (int, []string) {
+	mut repeat_count := 1
+	mut filtered := []string{cap: args.len}
+	mut should_skip_repeat_check := false
+	mut removed_self_command := false
+	prefix_count := int_min(int_max(protected_prefix_count, 0), args.len)
+	filtered << args[..prefix_count]
+	for arg in args[prefix_count..] {
+		if should_skip_repeat_check {
+			filtered << arg
+			should_skip_repeat_check = false
+			continue
+		}
+		if arg == '-cf' || pref.option_may_consume_value(arg) {
+			filtered << arg
+			should_skip_repeat_check = true
+			continue
+		}
+		if !removed_self_command && arg == 'self' {
+			removed_self_command = true
+			continue
+		}
+		if repeat_count == 1 {
+			count := repeat_count_arg(arg)
+			if count > 0 {
+				repeat_count = count
+				continue
+			}
+		}
+		filtered << arg
+	}
+	return repeat_count, filtered
+}
+
+fn has_gc_arg(args []string) bool {
+	for arg in args {
+		if arg == '-gc' {
+			return true
+		}
+		if arg.starts_with('-gc=') {
+			return true
+		}
+	}
+	return false
+}
+
+fn has_prealloc_arg(args []string) bool {
+	return args.any(it in ['-prealloc', '-no-prealloc'])
+}
+
+fn self_build_supports_prealloc(args []string, host_os string) bool {
+	mut target_os := host_os
+	mut ccompiler := ''
+	mut gc := 'none'
+	mut i := 0
+	for i < args.len {
+		arg := args[i]
+		if arg == '-os' {
+			if i + 1 < args.len {
+				target_os = args[i + 1]
+				i++
+			}
+		} else if arg.starts_with('-os=') {
+			target_os = arg.all_after('=')
+		} else if arg == '-cc' {
+			if i + 1 < args.len {
+				ccompiler = args[i + 1]
+				i++
+			}
+		} else if arg.starts_with('-cc=') {
+			ccompiler = arg.all_after('=')
+		} else if arg.starts_with('-cc ') {
+			ccompiler = arg.all_after('-cc ')
+		} else if arg == '-gc' {
+			if i + 1 < args.len {
+				gc = args[i + 1]
+				i++
+			}
+		} else if arg.starts_with('-gc=') {
+			gc = arg.all_after('=')
+		}
+		i++
+	}
+	return gc == 'none' && self_ccompiler_supports_prealloc(ccompiler, target_os)
+}
+
+fn self_ccompiler_supports_prealloc(ccompiler string, target_os string) bool {
+	cc := os.file_name(ccompiler.trim_space()).to_lower_ascii()
+	// Windows defaults to bundled TCC when no compiler is explicit.
+	if target_os == 'windows' && cc == '' {
+		return false
+	}
+	is_tinyc := cc.contains('tcc') || cc.contains('tinyc') || cc.contains('tinygcc')
+		|| cc.contains('tiny_gcc') || cc.contains('tiny-gcc')
+	return !is_tinyc || target_os in ['macos', 'freebsd', 'openbsd', 'netbsd', 'dragonfly']
+}
+
+fn has_profile_cflag(args []string) bool {
+	mut skip_next := false
+	for i, arg in args {
+		if skip_next {
+			skip_next = false
+			continue
+		}
+		if arg in ['-cflags', '-cf'] {
+			if i + 1 < args.len {
+				next_arg := args[i + 1]
+				if next_arg.contains('-fprofile') {
+					return true
+				}
+				skip_next = true
+			}
+			continue
+		}
+		if (arg.starts_with('-cflags=') || arg.starts_with('-cf=')) && arg.contains('-fprofile') {
+			return true
+		}
+	}
+	return false
+}
+
+fn pgo_compiler_kind(args []string) string {
+	if '-prod' !in args || '-no-prod-options' in args {
+		return ''
+	}
+	// A parallel self-build trades optimization for build time. PGO adds another
+	// compiler build and training passes, erasing the gain from splitting C compilation.
+	if '-parallel-cc' in args {
+		return ''
+	}
+	if os.user_os() == 'windows' {
+		return ''
+	}
+	if has_profile_cflag(args) {
+		return ''
+	}
+	ccompiler := self_build_c_compiler(args)
+	cc_file_name := os.file_name(ccompiler)
+	if cc_file_name.contains('clang') || cc_file_name.contains('gcc')
+		|| cc_file_name.contains('g++') || ccompiler == 'cc' {
+		cc_ver := os.exec([ccompiler, '--version']).output
+		if cc_ver.contains('clang') {
+			_ := find_llvm_profdata(ccompiler) or { return '' }
+			return 'clang'
+		}
+		if cc_ver.contains('Free Software Foundation') || cc_ver.contains('GCC') {
+			return 'gcc'
+		}
+	}
+	if cc_file_name.contains('clang') {
+		_ := find_llvm_profdata(ccompiler) or { return '' }
+		return 'clang'
+	}
+	if cc_file_name.contains('gcc') || cc_file_name.contains('g++') {
+		return 'gcc'
+	}
+	return ''
+}
+
+fn self_build_c_compiler(args []string) string {
+	// Environment flags precede CLI flags; the driver uses the last -cc.
+	mut ccompiler := ''
+	mut i := 0
+	for i < args.len {
+		arg := args[i]
+		if arg == '-cc' && i + 1 < args.len {
+			ccompiler = args[i + 1]
+		} else if arg.starts_with('-cc=') {
+			ccompiler = arg['-cc='.len..]
+		}
+		if arg in ['-prof', '-profile'] && i + 1 < args.len && args[i + 1].starts_with('-') {
+			i++
+		} else if (arg == '-cf' || pref.option_may_consume_value(arg)) && i + 1 < args.len {
+			i += 2
+		} else {
+			i++
+		}
+	}
+	return if ccompiler != '' { ccompiler } else { os.getenv_opt('CC') or { 'cc' } }
+}
+
+fn find_llvm_profdata(ccompiler string) !string {
+	// Clang launchers such as /usr/bin/clang can report a different installation
+	// directory. Use that toolchain before looking beside the launcher itself.
+	for line in os.exec([ccompiler, '--version']).output.split_into_lines() {
+		if line.starts_with('InstalledDir:') {
+			profdata := os.join_path(line.all_after(':').trim_space(), 'llvm-profdata')
+			if os.is_file(profdata) && os.is_executable(profdata) {
+				return profdata
+			}
+		}
+	}
+	if compiler := os.find_abs_path_of_executable(ccompiler) {
+		// Different LLVM releases can use incompatible raw profile formats.
+		// Resolve symlinks so a compiler in PATH still finds its own toolchain.
+		profdata := os.join_path(os.dir(os.real_path(compiler)), 'llvm-profdata')
+		if os.is_file(profdata) && os.is_executable(profdata) {
+			return profdata
+		}
+	}
+	if profdata := os.find_abs_path_of_executable('llvm-profdata') {
+		return profdata
+	}
+	$if macos {
+		xcrun_result := os.exec(['xcrun', '--find', 'llvm-profdata'])
+		if xcrun_result.exit_code == 0 {
+			xcrun_path := xcrun_result.output.trim_space()
+			if xcrun_path != '' && os.exists(xcrun_path) {
+				return xcrun_path
+			}
+		}
+	}
+	return error('can not find llvm-profdata in PATH')
+}
+
+fn with_output_arg(args []string, output string) []string {
+	mut res := []string{cap: args.len + 2}
+	mut skip_next := false
+	for i, arg in args {
+		if skip_next {
+			skip_next = false
+			continue
+		}
+		if arg == '-o' {
+			if i + 1 < args.len {
+				skip_next = true
+			}
+			continue
+		}
+		if arg.starts_with('-o=') {
+			continue
+		}
+		res << arg
+	}
+	res << ['-o', output]
+	return res
+}
+
+fn clone_args(args []string) []string {
+	mut cloned := []string{cap: args.len}
+	for arg in args {
+		cloned << arg.clone()
+	}
+	return cloned
+}
+
+fn self_build_host_os() string {
+	$if vself_test_windows_transition ? {
+		return 'windows'
+	}
+	$if vself_test_bsd_transition ? {
+		return 'freebsd'
+	}
+	$if vself_test_other_transition ? {
+		return 'haiku'
+	}
+	return os.user_os()
+}
+
+fn compose_v_cmd(vexe string, args []string, source string) string {
+	mut parts := []string{cap: args.len + 2}
+	parts << os.quoted_path(vexe)
+	for arg in args {
+		parts << os.quoted_path(arg)
+	}
+	parts << os.quoted_path(source)
+	return parts.join(' ')
+}
+
+fn run_cmd(cmd string) ! {
+	result := os.exec(os.split_args(cmd) or { panic(err) })
 	if result.exit_code != 0 {
-		eprintln('cannot compile to `$vroot`: \n$result.output')
-		exit(1)
+		return error(result.output)
 	}
 	if result.output.len > 0 {
 		println(result.output.trim_space())
 	}
 }
 
-fn list_folder(bmessage string, message string) {
+fn try_compile(cmd string) bool {
+	result := os.exec(os.split_args(cmd) or { panic(err) })
+	if result.exit_code != 0 {
+		return false
+	}
+	if result.output.len > 0 {
+		println(result.output.trim_space())
+	}
+	return true
+}
+
+fn compile_with_pgo(vroot string, vexe string, args []string, out_binary string, cc_kind string) bool {
+	// Separate concurrent self-builds, and only remove a directory this invocation created.
+	pgo_workspace := os.join_path(vroot, '.vself_pgo_${os.getpid()}')
+	os.mkdir(pgo_workspace) or {
+		eprintln('PGO disabled: can not create ${pgo_workspace}: ${err.msg()}')
+		return false
+	}
+	defer {
+		os.rmdir_all(pgo_workspace) or {}
+	}
+	profile_dir := os.join_path(pgo_workspace, 'profile')
+	os.mkdir_all(profile_dir) or {
+		eprintln('PGO disabled: can not create ${profile_dir}: ${err.msg()}')
+		return false
+	}
+	pgo_binary := os.join_path(pgo_workspace, 'v_pgo_gen')
+	training_output := os.join_path(pgo_workspace, 'cmd_v_training.c')
+	mut use_profile_flag := '-fprofile-use=${profile_dir}'
+	mut llvm_profdata := ''
+	mut profile_data := ''
+	if cc_kind == 'clang' {
+		llvm_profdata = find_llvm_profdata(self_build_c_compiler(effective_self_build_args(args))) or {
+			eprintln('PGO disabled: can not find `llvm-profdata`.')
+			return false
+		}
+		profile_data = os.join_path(pgo_workspace, 'code.profdata')
+		use_profile_flag = '-fprofile-use=${profile_data}'
+	}
+	mut generate_args := with_output_arg(args, pgo_binary)
+	// -cflags is parsed again by the compiler, so keep paths with spaces together.
+	generate_args << ['-cflags', os.quoted_path('-fprofile-generate=${profile_dir}')]
+	// Training uses worker threads, so counter increments must not lose updates.
+	generate_args << ['-cflags', '-fprofile-update=atomic']
+	generate_cmd := compose_v_cmd(vexe, generate_args, full_v_cli_source)
+	run_cmd(generate_cmd) or {
+		eprintln('PGO step failed while building the instrumented compiler.')
+		eprintln(err.msg())
+		return false
+	}
+	mut training_args := ['-nocache', '-gc', 'none', '-prealloc', '-building-v', '-o', training_output]
+	if self_build_trains_fastc(effective_self_build_args(args)) {
+		training_args << ['-compile-backend', 'fastc']
+	}
+	no_parallel := '-no-parallel' in effective_self_build_args(args)
+	if no_parallel {
+		training_args << '-no-parallel'
+	}
+	// Exercise real V3 compilation, rather than an inherited cache or V1 fallback.
+	training_cmd := 'env -u VFLAGS -u VEXE -u LLVM_PROFILE_FILE V_MACOS_V3_NO_FALLBACK=1 ' +
+		compose_v_cmd(pgo_binary, training_args, full_v_cli_source)
+	run_cmd(training_cmd) or {
+		eprintln('PGO step failed while generating the profiling data.')
+		eprintln(err.msg())
+		return false
+	}
+	if !no_parallel && os.getenv('VJOBS') != '1' {
+		// Cover both worker dispatch and the serial checker/codegen paths. The
+		// second run changes only its child's environment, not the final build's.
+		run_cmd('env VJOBS=1 ${training_cmd}') or {
+			eprintln('PGO step failed while generating the serial profiling data.')
+			eprintln(err.msg())
+			return false
+		}
+	}
+	if self_build_trains_fastc(effective_self_build_args(args))
+		&& os.is_executable(os.join_path(vroot, 'thirdparty', 'tcc', 'tcc.exe')) {
+		// Including FastC in the generated compiler does not execute its backend.
+		// Train it too, while retaining the normal C backend's profile above.
+		mut fastc_training_args := with_output_arg(training_args, os.join_path(pgo_workspace,
+			'cmd_v_fastc_training.c'))
+		fastc_training_args << ['-b', 'fastc', '-no-memory-limit']
+		fastc_training_cmd := 'env -u VFLAGS -u VEXE -u LLVM_PROFILE_FILE V_MACOS_V3_NO_FALLBACK=1 ' +
+			compose_v_cmd(pgo_binary, fastc_training_args, full_v_cli_source)
+		run_cmd(fastc_training_cmd) or {
+			eprintln('PGO step failed while generating the FastC profiling data.')
+			eprintln(err.msg())
+			return false
+		}
+		if !no_parallel && os.getenv('VJOBS') != '1' {
+			run_cmd('env VJOBS=1 ${fastc_training_cmd}') or {
+				eprintln('PGO step failed while generating the serial FastC profiling data.')
+				eprintln(err.msg())
+				return false
+			}
+		}
+	}
+	if cc_kind == 'clang' {
+		merge_cmd := '${os.quoted_path(llvm_profdata)} merge -output=${os.quoted_path(profile_data)} ${os.quoted_path(profile_dir)}'
+		run_cmd(merge_cmd) or {
+			eprintln('PGO step failed while merging the profiling data.')
+			eprintln(err.msg())
+			return false
+		}
+	}
+	mut final_args := with_output_arg(args, out_binary)
+	final_args << ['-cflags', os.quoted_path(use_profile_flag)]
+	if cc_kind == 'gcc' {
+		final_args << ['-cflags', '-fprofile-correction']
+	}
+	final_cmd := compose_v_cmd(vexe, final_args, full_v_cli_source)
+	run_cmd(final_cmd) or {
+		eprintln('PGO step failed while building the final compiler binary.')
+		eprintln(err.msg())
+		return false
+	}
+	return true
+}
+
+fn self_build_trains_fastc(args []string) bool {
+	mut includes_fastc := '-prod' in args
+	for i, arg in args {
+		if arg == '-old-compiler' {
+			return false
+		}
+		if arg in ['-d', '-define'] && i + 1 < args.len
+			&& args[i + 1].all_before('=').trim_space() == 'skip_fastc' {
+			return false
+		}
+		if arg.starts_with('-d') && arg.len > 2 && arg[2..].all_before('=') == 'skip_fastc' {
+			return false
+		}
+		if arg in ['-all-backends', '--all-backends'] {
+			includes_fastc = true
+		}
+		if arg in ['-compile-backend', '--compile-backend'] && i + 1 < args.len
+			&& args[i + 1].split(',').any(it.trim_space() == 'fastc') {
+			includes_fastc = true
+		}
+	}
+	return includes_fastc
+}
+
+fn bootstrap_self_build(vroot string, args []string, final_binary string) ! {
+	bootstrap_prefix := '.vself_bootstrap'
+	mut bootstrap_v1 := '${bootstrap_prefix}_v1'
+	mut bootstrap_v2 := '${bootstrap_prefix}_v2'
+	exe_ext := if os.user_os() == 'windows' { '.exe' } else { '' }
+	bootstrap_v1 += exe_ext
+	bootstrap_v2 += exe_ext
+	os.rm(bootstrap_v1) or {}
+	os.rm(bootstrap_v2) or {}
+	defer {
+		os.rm(bootstrap_v1) or {}
+		os.rm(bootstrap_v2) or {}
+	}
+	mut vc_source := os.join_path(vroot, 'vc', if os.user_os() == 'windows' {
+		'v_win.c'
+	} else {
+		'v.c'
+	})
+	if !os.exists(vc_source) {
+		return error('bootstrap fallback failed: `${vc_source}` is missing')
+	}
+	compat_source := os.join_path(vroot, 'vc', 'v_self_compat.c')
+	defer {
+		if os.user_os() == 'windows' {
+			os.rm(compat_source) or {}
+		}
+	}
+	if os.user_os() == 'windows' {
+		filter := os.join_path(vroot, 'cmd', 'tools', 'vc_compat_uint.ps1')
+		run_cmd('powershell -NoProfile -ExecutionPolicy Bypass -File ${os.quoted_path(filter)} -Source ${os.quoted_path(vc_source)} -Destination ${os.quoted_path(compat_source)}')!
+		vc_source = compat_source
+	}
+	cc := os.getenv_opt('CC') or {
+		if os.user_os() == 'windows' { 'gcc' } else { 'cc' }
+	}
+	bootstrap_v1_build_cmd := bootstrap_c_cmd(cc, bootstrap_v1, vc_source)
+	run_cmd(bootstrap_v1_build_cmd) or {
+		return error('bootstrap fallback failed while building v1.\n${err.msg()}')
+	}
+	mut bootstrap_args := ['-no-parallel']
+	bootstrap_args << with_output_arg(initial_bootstrap_args(args), bootstrap_v2)
+	bootstrap_v1_cmd := os.join_path('.', bootstrap_v1)
+	bootstrap_v2_cmd := '${os.quoted_path(bootstrap_v1_cmd)} ${bootstrap_args.join(' ')} ${os.quoted_path(full_v_cli_source)}'
+	run_cmd(bootstrap_v2_cmd) or {
+		return error('bootstrap fallback failed while building v2.\n${err.msg()}')
+	}
+	final_args := with_output_arg(args, final_binary)
+	bootstrap_v2_cmd_path := os.join_path('.', bootstrap_v2)
+	final_cmd := '${os.quoted_path(bootstrap_v2_cmd_path)} ${final_args.join(' ')} ${os.quoted_path(full_v_cli_source)}'
+	run_cmd(final_cmd) or {
+		return error('bootstrap fallback failed while building the final compiler.\n${err.msg()}')
+	}
+}
+
+fn initial_bootstrap_args(args []string) []string {
+	// vc/v.c can be one generation behind this source tree. Its parallel C
+	// splitter predates the single-definition header protocol, and older copies
+	// may also predate V3's process-memory switch. The compiler it produces is
+	// current and receives the original arguments for the final build. Its V1
+	// compiler also predates `-compile-backend`.
+	mut filtered := []string{cap: args.len}
+	mut i := 0
+	for i < args.len {
+		arg := args[i]
+		if arg in ['-compile-backend', '--compile-backend'] && i + 1 < args.len {
+			i += 2
+			continue
+		}
+		if arg !in ['-parallel-cc', '-no-memory-limit', '--no-memory-limit'] {
+			filtered << arg
+		}
+		i++
+	}
+	return filtered
+}
+
+fn bootstrap_c_cmd(cc string, out_binary string, vc_source string) string {
+	mut parts := []string{cap: 8}
+	// Portable VC snapshots have the full V1 compiler but no embedded V3 driver.
+	if os.user_os() == 'windows' {
+		parts << [os.quoted_path(cc), '-DCUSTOM_DEFINE_v1_fallback']
+		// vc/v_win.c calls BCryptGenRandom, so -lws2_32 alone fails to link, the same
+		// way GNUmakefile and makev.bat need -lbcrypt for this snapshot.
+		parts << ['-std=c99', '-municode', '-w', '-o', os.quoted_path(out_binary),
+			os.quoted_path(vc_source), '-lws2_32', '-lbcrypt']
+	} else {
+		compat_script := os.join_path(os.dir(os.dir(vc_source)), 'cmd', 'tools', 'vc_compat.sh')
+		parts << ['sh', os.quoted_path(compat_script), os.quoted_path(vc_source), os.quoted_path(cc),
+			'-DCUSTOM_DEFINE_v1_fallback']
+		parts << ['-std=c99', '-w', '-o', os.quoted_path(out_binary), '--', '-lm', '-lpthread']
+	}
+	return parts.join(' ')
+}
+
+fn list_folder(short_v_name string, bmessage string, message string) {
 	if !is_debug {
 		return
 	}
 	if bmessage != '' {
 		println(bmessage)
 	}
+	entries := os.ls('.') or { []string{} }
+	matching := entries.filter(it.starts_with(short_v_name))
 	if os.user_os() == 'windows' {
-		os.system('dir v*.exe')
-	} else {
-		os.system('ls -lartd v*')
+		for entry in matching.filter(it.ends_with('.exe')) {
+			println(entry)
+		}
+	} else if matching.len > 0 {
+		os.system_args(['ls', '-lartd', ...matching])
 	}
 	println(message)
 }
 
-fn backup_old_version_and_rename_newer() ?bool {
+fn backup_old_version_and_rename_newer(short_v_name string) !bool {
 	mut errors := []string{}
-	short_v_file := if os.user_os() == 'windows' { 'v.exe' } else { 'v' }
+	short_v_file := if os.user_os() == 'windows' {
+		'${short_v_name}.exe'
+	} else {
+		'${short_v_name}'
+	}
 	short_v2_file := if os.user_os() == 'windows' { 'v2.exe' } else { 'v2' }
 	short_bak_file := if os.user_os() == 'windows' { 'v_old.exe' } else { 'v_old' }
 	v_file := os.real_path(short_v_file)
 	v2_file := os.real_path(short_v2_file)
 	bak_file := os.real_path(short_bak_file)
 
-	list_folder('before:', 'removing $bak_file ...')
+	list_folder(short_v_name, 'before:', 'removing ${bak_file} ...')
 	if os.exists(bak_file) {
-		os.rm(bak_file) or { errors << 'failed removing $bak_file: $err.msg' }
+		os.rm(bak_file) or { errors << 'failed removing ${bak_file}: ${err.msg()}' }
+	}
+	if os.is_file('${bak_file}.manifest') {
+		os.rm('${bak_file}.manifest')!
 	}
 
-	list_folder('', 'moving $v_file to $bak_file ...')
-	os.mv(v_file, bak_file) or { errors << err.msg }
+	list_folder(short_v_name, '', 'moving ${v_file} to ${bak_file} ...')
+	os.mv(v_file, bak_file) or { errors << err.msg() }
+	if os.is_file('${v_file}.manifest') {
+		os.mv('${v_file}.manifest', '${bak_file}.manifest')!
+	}
 
-	list_folder('', 'removing $v_file ...')
+	list_folder(short_v_name, '', 'removing ${v_file} ...')
 	os.rm(v_file) or {}
 
-	list_folder('', 'moving $v2_file to $v_file ...')
-	os.mv_by_cp(v2_file, v_file) or { panic(err.msg) }
+	list_folder(short_v_name, '', 'moving ${v2_file} to ${v_file} ...')
+	os.mv_by_cp(v2_file, v_file) or { panic(err.msg()) }
+	if os.is_file('${v2_file}.manifest') {
+		os.mv('${v2_file}.manifest', '${v_file}.manifest')!
+	}
 
-	list_folder('after:', '')
+	list_folder(short_v_name, 'after:', '')
 
 	if errors.len > 0 {
 		eprintln('backup errors:\n  >>  ' + errors.join('\n  >>  '))

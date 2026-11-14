@@ -1,0 +1,1030 @@
+module c
+
+import strings
+import v.flat
+import v.pref
+import v.types
+import v.workers
+
+fn test_taken_builder_text_owns_a_terminated_string() {
+	mut sb := strings.new_builder(16)
+	sb.write_string('prefix!')
+	sb.go_back(1)
+	text := cgen_take_builder_text(mut sb)
+	// Truncation leaves a nonzero byte after the payload until it is terminated.
+	assert text == 'prefix'
+	assert unsafe { text.str[text.len] } == 0
+	unsafe { text.free() }
+	mut empty := strings.new_builder(16)
+	assert empty.cap >= 16
+	assert cgen_take_builder_text(mut empty) == ''
+	assert empty.cap == 0
+	assert isnil(empty.data)
+	unsafe { empty.free() }
+}
+
+fn test_forward_decl_lane_bounds_are_strictly_increasing() {
+	mut a := flat.FlatAst.new()
+	mut items := []FlatFnGenItem{cap: 4096}
+	for i in 0 .. 4096 {
+		node_id := a.add_node(flat.Node{
+			kind:           .fn_decl
+			value:          'fn_${i}'
+			children_count: u32(i % 17 + 1)
+		})
+		items << FlatFnGenItem{
+			node_id: node_id
+			c_name:  'fn_${i}'
+		}
+	}
+	bounds := forward_decl_lane_bounds(&a, items)
+	assert bounds.len >= 2
+	assert bounds.len <= 9
+	assert bounds.first() == 0
+	assert bounds.last() == items.len
+	for i in 1 .. bounds.len {
+		assert bounds[i] > bounds[i - 1]
+	}
+}
+
+fn test_forward_decl_lanes_do_not_repeat_boundaries_for_one_expensive_item() {
+	for expensive_index in [0, 2048, 4095] {
+		mut a := flat.FlatAst.new()
+		mut items := []FlatFnGenItem{cap: 4096}
+		for i in 0 .. 4096 {
+			node_id := a.add_node(flat.Node{
+				kind:           .fn_decl
+				children_count: if i == expensive_index { u32(10_000_000) } else { u32(1) }
+			})
+			items << FlatFnGenItem{ node_id: node_id, c_name: 'fn_${i}' }
+		}
+		bounds := forward_decl_lane_bounds(&a, items)
+		assert bounds.first() == 0
+		assert bounds.last() == items.len
+		assert bounds.len <= 9
+		for i in 1 .. bounds.len {
+			assert bounds[i] > bounds[i - 1], '${expensive_index}: ${bounds}'
+		}
+	}
+}
+
+fn test_scoped_cgen_batches_amortize_small_bodies_and_bound_compiler_scratch() {
+	g, mut tc := parallel_worker_test_gen(true)
+	assert g.scoped_cgen_batch_count(0, 0) == 0
+	assert g.scoped_cgen_batch_count(169, 1000) == 1
+	assert g.scoped_cgen_batch_count(445, 100_000) < 10
+	assert g.scoped_cgen_batch_count(1, 1_000_000) == 1
+	assert g.scoped_cgen_batch_count(10_000, 100_000_000) == scoped_cgen_worker_batches
+	tc.building_v_fast = true
+	assert g.scoped_cgen_batch_count(12, 1000) == 12
+	assert g.scoped_cgen_batch_count(10_000, 100_000_000) == scoped_cgen_worker_batches
+}
+
+fn test_parallel_cgen_job_limit_preserves_large_graph_and_compiler_dispatch() {
+	mut g, mut tc := parallel_worker_test_gen(true)
+	mut used := {
+		'main': true
+	}
+	g.used_fns = &used
+	assert g.flat_cgen_job_limit() == max_small_flat_cgen_jobs
+	// An explicit smaller runtime pool and a short work list remain authoritative.
+	assert flat_cgen_job_count(4, 100, g.flat_cgen_job_limit()) == 4
+	assert flat_cgen_job_count(100, 3, g.flat_cgen_job_limit()) == 3
+	assert flat_cgen_job_count(0, 100, g.flat_cgen_job_limit()) == 0
+	assert flat_cgen_job_count(100, 0, g.flat_cgen_job_limit()) == 0
+	assert flat_cgen_job_count(100, 100, g.flat_cgen_job_limit()) == max_small_flat_cgen_jobs
+	tc.building_v_fast = true
+	assert g.flat_cgen_job_limit() == max_flat_cgen_jobs
+	tc.building_v_fast = false
+	for i in 1 .. large_flat_cgen_graph_items {
+		used['fn_' + i.str()] = true
+	}
+	assert g.flat_cgen_job_limit() == max_flat_cgen_jobs
+	assert flat_cgen_job_count(100, 100, g.flat_cgen_job_limit()) == max_flat_cgen_jobs
+}
+
+fn test_parallel_function_chunks_use_available_items_when_jobs_exceed_items() {
+	items := [FlatFnGenItem{
+		c_name: 'first'
+		cost:   1
+	}, FlatFnGenItem{
+		c_name: 'second'
+		cost:   100
+	}, FlatFnGenItem{
+		c_name: 'third'
+		cost:   1
+	}]
+	for jobs in [items.len, items.len * flat_cgen_chunks_per_job] {
+		chunks := split_flat_cgen_items(items, jobs)
+		assert chunks.len == items.len
+		for i, chunk in chunks {
+			assert chunk.len == 1
+			assert chunk[0].c_name == items[i].c_name
+		}
+	}
+	assert split_flat_cgen_items(items, 1) == [items]
+	assert split_flat_cgen_items(items, 0).len == 0
+	assert split_flat_cgen_items([]FlatFnGenItem{}, 4).len == 0
+}
+
+fn test_parallel_function_chunks_reserve_items_after_expensive_function() {
+	items := [FlatFnGenItem{
+		c_name: 'first'
+		cost:   1
+	}, FlatFnGenItem{
+		c_name: 'expensive'
+		cost:   100
+	}, FlatFnGenItem{
+		c_name: 'third'
+		cost:   1
+	}, FlatFnGenItem{
+		c_name: 'fourth'
+		cost:   1
+	}]
+	chunks := split_flat_cgen_items(items, 3)
+	assert chunks.len == 3
+	assert chunks[0] == items[..2]
+	assert chunks[1] == items[2..3]
+	assert chunks[2] == items[3..]
+}
+
+fn parallel_worker_test_gen(scoped bool) (&FlatGen, &types.TypeChecker) {
+	mut ast := &flat.FlatAst{}
+	mut tc := types.TypeChecker.new(ast)
+	mut g := FlatGen.new()
+	g.a = ast
+	g.tc = &tc
+	g.scope_parallel_workers = scoped
+	return &g, &tc
+}
+
+fn test_interface_impl_scan_worker_does_not_read_master_c_name_cache() {
+	$if !v3_no_parallel ? {
+		g, _ := parallel_worker_test_gen(true)
+		worker := g.new_interface_impl_scan_worker()
+		assert voidptr(worker.c_name_cache) != voidptr(g.c_name_cache)
+		assert isnil(worker.c_name_cache.base)
+		assert g.cname('main.Master.name') == worker.cname('main.Master.name')
+	}
+}
+
+fn test_parallel_dispatch_worker_owns_checker_outside_scoped_batching() {
+	g, tc := parallel_worker_test_gen(false)
+	w := g.new_parallel_dispatch_worker(1)
+	assert w.tc != tc
+}
+
+fn test_implicit_veb_context_call_lookup_accepts_source_and_c_names() {
+	g, mut tc := parallel_worker_test_gen(false)
+	assert !g.call_has_implicit_veb_ctx(['', 'app.index'])
+	tc.fn_implicit_veb_ctx['app.index'] = true
+	assert g.call_has_implicit_veb_ctx(['missing', 'app.index'])
+	assert !g.call_has_implicit_veb_ctx(['missing'])
+	tc.fn_implicit_veb_ctx.clear()
+	tc.fn_implicit_veb_ctx['app__index'] = true
+	assert g.call_has_implicit_veb_ctx(['', 'app.index'])
+	tc.fn_implicit_veb_ctx['app__index'] = false
+	assert !g.call_has_implicit_veb_ctx(['app.index'])
+}
+
+fn test_shared_param_index_skips_all_false_signatures() {
+	mut g, mut tc := parallel_worker_test_gen(true)
+	tc.fn_shared_params['plain'] = [false, false]
+	tc.fn_shared_params['empty'] = []bool{}
+	g.precompute_shared_param_index()
+	assert g.shared_param_index_empty
+	assert g.fn_shared_params_resolved.len == 0
+	assert !g.fn_param_is_shared('plain', 0)
+	assert !g.fn_param_is_shared_for_call(0, 'plain', 'empty', '', '')
+	w := g.new_parallel_worker(1)
+	assert w.shared_param_index_empty
+	assert !w.fn_param_is_shared_for_call(1, 'plain', '', '', '')
+
+	// A single shared signature keeps exact false entries authoritative over
+	// shared short-name fallbacks, including when the index is prepared again.
+	tc.fn_shared_params['send'] = [true]
+	tc.fn_shared_params['dep.send'] = [true]
+	g.fn_decl_shared_params['dep.send'] = [false]
+	g.precompute_shared_param_index()
+	assert !g.shared_param_index_empty
+	assert g.fn_param_is_shared_for_call(0, 'send', '', '', '')
+	assert !g.fn_param_is_shared_for_call(0, 'dep.send', '', '', '')
+	assert !g.fn_param_is_shared_for_call(1, 'send', '', '', '')
+	assert !g.fn_param_is_shared_for_call(0, 'plain', '', '', '')
+}
+
+fn test_parallel_dispatch_worker_shares_checker_as_scoped_accumulator() {
+	g, tc := parallel_worker_test_gen(true)
+	w := g.new_parallel_dispatch_worker(1)
+	assert w.tc == tc
+}
+
+fn test_scoped_dispatcher_snapshots_optional_types_before_declaration_growth() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.emitted_optional_types['__v_option_int'] = true
+	mut dispatcher := g.new_parallel_dispatch_worker(1)
+	// Declaration emission grows the master's map while dispatchers create
+	// chunk workers. Their snapshots must not read that mutable backing.
+	for i in 0 .. 256 {
+		g.emitted_optional_types['__v_option_decl_${i}'] = true
+	}
+	mut first := dispatcher.new_parallel_worker(0)
+	assert first.emitted_optional_types == {
+		'__v_option_int': true
+	}
+	for i in 256 .. 512 {
+		g.emitted_optional_types['__v_option_decl_${i}'] = true
+	}
+	first.emitted_optional_types['__v_option_chunk'] = true
+	second := dispatcher.new_parallel_worker(1)
+	assert second.emitted_optional_types == {
+		'__v_option_int': true
+	}
+	assert dispatcher.emitted_optional_types == second.emitted_optional_types
+	assert g.emitted_optional_types.len == 513
+	assert '__v_option_chunk' !in g.emitted_optional_types
+}
+
+fn test_scoped_parallel_dispatch_worker_owns_string_snapshot() {
+	mut g, _ := parallel_worker_test_gen(true)
+	assert g.intern_string('source') == 0
+	mut w := g.new_parallel_dispatch_worker(1)
+	assert !w.str_lits_shared
+	assert w.intern_string('worker generated') == 1
+	assert g.str_lits == ['source']
+	assert g.intern_string('master generated') == 1
+	assert w.str_lits == ['source', 'worker generated']
+	assert g.str_lits == ['source', 'master generated']
+}
+
+fn test_scoped_parallel_dispatch_workers_detach_shared_string_snapshot() {
+	mut g, _ := parallel_worker_test_gen(true)
+	assert g.intern_string('source') == 0
+	g.str_lits_shared = true
+	mut first := g.new_parallel_dispatch_worker(1)
+	mut second := g.new_parallel_dispatch_worker(2)
+	assert first.str_lits_shared
+	assert second.str_lits_shared
+	assert g.intern_string('master generated') == 1
+	assert first.str_lits == ['source']
+	assert first.intern_string('first generated') == 1
+	assert second.str_lits == ['source']
+	assert second.intern_string('second generated') == 1
+	assert g.str_lits == ['source', 'master generated']
+	assert first.str_lits == ['source', 'first generated']
+	assert second.str_lits == ['source', 'second generated']
+}
+
+fn test_scoped_parallel_worker_reuses_preselected_functions_and_c_extern_refs() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.fn_gen_items = [FlatFnGenItem{
+		c_name: 'main__run'
+	}]
+	g.c_extern_refs['puts'] = true
+	g.c_extern_refs_ready = true
+
+	w := g.new_parallel_worker(1)
+	assert w.fn_gen_items.len == 1
+	assert w.fn_gen_items[0].c_name == 'main__run'
+	assert w.c_extern_refs == {
+		'puts': true
+	}
+	assert w.c_extern_refs_ready
+}
+
+fn test_parallel_worker_shares_precomputed_const_short_index() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.const_vals = {
+		'moda.only':   flat.NodeId(0)
+		'moda.answer': flat.NodeId(1)
+		'modb.answer': flat.NodeId(2)
+	}
+	g.precompute_const_short_index()
+	assert g.const_short_index.built
+	assert g.const_short_index.entries['only'] == 'moda.only'
+	assert g.const_short_index.entries['answer'] == ''
+
+	w := g.new_parallel_worker(1)
+	assert w.const_short_index == g.const_short_index
+	assert w.unique_const_ref_name('only') or { '' } == 'moda.only'
+	assert w.unique_const_ref_name('answer') == none
+}
+
+fn test_parallel_worker_preserves_test_assertion_stats_mode() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.show_test_stats = true
+	w := g.new_parallel_worker(1)
+	assert w.show_test_stats
+}
+
+fn test_parallel_worker_preserves_target() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.target = pref.target_from('linux', 'x86') or { panic(err) }
+	w := g.new_parallel_worker(1)
+	assert w.target == g.target
+}
+
+fn test_windows_filelock_method_preseeds_parallel_compat_helpers() {
+	mut g, _ := parallel_worker_test_gen(true)
+	mut used := {
+		'filelock.FileLock.lock_handle': true
+	}
+	g.used_fns = &used
+	// Isolate used-function reachability from the later function-body reference scan.
+	g.c_extern_refs_ready = true
+	g.preseed_libc_compat_fns()
+	assert g.libc_compat_fns['filelock']
+
+	g.libc_compat_fns.delete('filelock')
+	g.filelock_compat_decls()
+	c_code := g.sb.str()
+	assert c_code.contains('static inline int v_filelock_lock(HANDLE handle'), c_code
+	assert c_code.contains('static inline int v_filelock_unlock(HANDLE handle'), c_code
+}
+
+fn test_builtin_gettid_preseeds_parallel_compat_helper() {
+	mut g, _ := parallel_worker_test_gen(true)
+	mut used := {
+		'v_gettid': true
+	}
+	g.used_fns = &used
+	// Isolate used-function reachability from the later function-body reference scan.
+	g.c_extern_refs_ready = true
+	g.preseed_libc_compat_fns()
+	assert g.libc_compat_fns['gettid']
+}
+
+fn test_parallel_tail_worker_preserves_runtime_init_module_order() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.compile_defines = ['gcboehm']
+	g.const_runtime_inits = ['\tmoda__runtime_const = moda__make_const();']
+	g.const_runtime_init_modules = ['moda']
+	g.runtime_inits = ['\tmoda__runtime_global = moda__make_global();']
+	g.runtime_init_modules = ['moda']
+	g.module_init_fns = ['moda__init']
+	g.module_init_fn_modules['moda__init'] = 'moda'
+
+	mut tail := g.new_parallel_tail_worker(max_flat_cgen_jobs + 1)
+	tail.gen_vinit()
+	output := tail.sb.str()
+	gc_pos := output.index('gc_runtime_init();') or { -1 }
+	const_pos := output.index('moda__runtime_const = moda__make_const();') or { -1 }
+	global_pos := output.index('moda__runtime_global = moda__make_global();') or { -1 }
+	init_pos := output.index('moda__init();') or { -1 }
+	assert gc_pos >= 0
+	assert const_pos > gc_pos
+	assert global_pos > const_pos
+	assert init_pos > global_pos
+}
+
+fn test_parallel_tail_worker_preserves_shared_cleanup_mode() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.is_shared = true
+	assert g.module_cleanup_fns.len == 0
+
+	mut tail := g.new_parallel_tail_worker(max_flat_cgen_jobs + 1)
+	tail.gen_vcleanup()
+	output := tail.sb.str()
+	assert tail.is_shared
+	assert output.contains('void _vcleanup(void) {')
+}
+
+fn test_parallel_checker_clone_preserves_sparse_transform_caches() {
+	g, mut tc := parallel_worker_test_gen(false)
+	tc.a.nodes = [flat.Node{
+		kind: .ident
+	}, flat.Node{
+		kind: .ident
+	}]
+	tc.resolved_call_names = [types.cached_name('source_call')]
+	tc.resolved_call_set = [true]
+	tc.expr_type_values = [tc.intern_type_reference(types.Type(types.int_))]
+	tc.expr_type_set = [true]
+	tc.begin_sparse_transform_node_caches(1)
+	tc.sparse_resolved_call_names[1] = 'transformed_call'
+	tc.sparse_expr_type_values[1] = types.Type(types.String{})
+
+	w := g.clone_parallel_type_checker()
+	assert w.parallel_check_sparse
+	assert w.check_range_lo == 0
+	assert w.check_range_hi == 0
+	assert w.resolved_call_name(flat.NodeId(0)) or { '' } == 'source_call'
+	assert w.resolved_call_name(flat.NodeId(1)) or { '' } == 'transformed_call'
+	assert w.expr_type(flat.NodeId(0)) or { types.Type(types.void_) } is types.Primitive
+	assert w.expr_type(flat.NodeId(1)) or { types.Type(types.void_) } is types.String
+	assert g.parallel_cached_expr_type(flat.NodeId(0), tc.a.nodes[0]) or { types.Type(types.void_) } is types.Primitive
+	assert g.parallel_cached_expr_type(flat.NodeId(1), tc.a.nodes[1]) or { types.Type(types.void_) } is types.String
+}
+
+fn test_parallel_checker_clone_keeps_checked_file_scope_identity() {
+	g, mut tc := parallel_worker_test_gen(true)
+	tc.file_scope.insert('file_value', types.Type(types.int_))
+	tc.resolution_type_mode = true
+	w := g.clone_parallel_type_checker()
+	assert w.file_scope == tc.file_scope
+	assert w.cur_scope != w.file_scope
+	assert w.resolution_type_mode
+	owner := w.cur_scope.lookup_owner('file_value') or { panic('missing file binding') }
+	assert owner.belongs_to_scope(w.file_scope)
+}
+
+fn test_scoped_cgen_batch_preserves_worker_interned_literals() {
+	mut g, _ := parallel_worker_test_gen(true)
+	assert g.intern_string('source') == 0
+	for generated in ['generated_a', 'generated_b'] {
+		mut batch := g.new_parallel_worker(0)
+		generated_id := batch.intern_string(generated)
+		assert generated_id == g.str_lits.len
+		g.absorb_scoped_cgen_batch(batch, false)
+		assert g.str_lits[generated_id] == generated
+		assert g.str_lit_ids[generated] == generated_id
+	}
+	assert g.str_lits == ['source', 'generated_a', 'generated_b']
+}
+
+fn test_scoped_cgen_batch_remaps_colliding_worker_literals() {
+	mut g, _ := parallel_worker_test_gen(true)
+	assert g.intern_string('source') == 0
+
+	mut batch := g.new_parallel_worker(0)
+	assert batch.intern_string('shared') == 1
+	assert batch.intern_string('generated') == 2
+	batch.sb.write_string('use(_str_1, _str_2);')
+	batch.add_spawn_wrapper_def('spawn(_str_2);')
+
+	assert g.intern_string('shared') == 1
+	assert g.intern_string('master') == 2
+	g.absorb_scoped_cgen_batch(batch, false)
+
+	assert g.str_lits == ['source', 'shared', 'master', 'generated']
+	assert g.fn_segs == ['use(_str_1, _str_3);']
+	assert g.spawn_wrapper_defs == ['spawn(_str_3);']
+}
+
+fn test_scoped_cgen_worker_merge_publishes_generated_literals() {
+	mut g, _ := parallel_worker_test_gen(true)
+	assert g.intern_string('source') == 0
+
+	mut helper := g.new_parallel_dispatch_worker(1)
+	mut helper_batch := helper.new_parallel_worker(0)
+	assert helper_batch.intern_string('helper generated') == 1
+	helper_batch.sb.write_string('helper(_str_1); "_str_1"; /* _str_1 */')
+	helper_batch.add_spawn_wrapper_def('spawn_helper(_str_1);')
+	helper.absorb_scoped_cgen_batch(helper_batch, false)
+
+	mut master_batch := g.new_parallel_worker(0)
+	assert master_batch.intern_string('master generated') == 1
+	master_batch.sb.write_string('master(_str_1);')
+	g.absorb_scoped_cgen_batch(master_batch, false)
+	g.merge_parallel_worker(helper)
+
+	assert g.str_lits == ['source', 'master generated', 'helper generated']
+	assert g.str_lit_ids['helper generated'] == 2
+	assert g.fn_segs == ['master(_str_1);', 'helper(_str_2); "_str_1"; /* _str_1 */']
+	assert g.spawn_wrapper_defs == ['spawn_helper(_str_2);']
+}
+
+fn test_scoped_cgen_string_remap_preserves_user_c_identifiers() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.c_extern_refs['_str_999'] = true
+	g.c_extern_refs_ready = true
+	user_c_symbols := g.cache_user_c_string_symbols()
+	remap := {
+		1:   2
+		999: 1000
+	}
+	source := 'helper(_str_1); _str_999(); "_str_1"; /* _str_999 */'
+	assert remap_scoped_worker_string_symbols(source, remap, user_c_symbols) == 'helper(_str_2); _str_999(); "_str_1"; /* _str_999 */'
+}
+
+fn test_fused_parallel_prep_interns_body_string_literals() {
+	mut g, _ := parallel_worker_test_gen(false)
+	g.a.nodes = [
+		flat.Node{
+			kind:           .fn_decl
+			children_start: 0
+			children_count: 1
+		},
+		flat.Node{
+			kind:  .string_literal
+			value: 'worker literal'
+		},
+	]
+	g.a.children = [flat.NodeId(1)]
+	mut stack := []flat.NodeId{}
+	mut type_text_cache := map[u32]bool{}
+	g.fn_item_cost_and_prep(0, mut stack, mut type_text_cache)
+	assert g.str_lits == ['worker literal']
+	assert g.str_lit_ids['worker literal'] == 0
+}
+
+fn test_serial_prep_interns_ast_string_literals_in_source_order() {
+	mut g, _ := parallel_worker_test_gen(false)
+	g.ast_string_literals = ['first', 'second']
+	g.ast_string_literals_ready = true
+	g.prepare_serial_fn_tables()
+	assert g.str_lits == ['first', 'second']
+	assert g.str_lit_ids['first'] == 0
+	assert g.str_lit_ids['second'] == 1
+}
+
+fn test_dispatch_worker_literals_are_numbered_in_chunk_order() {
+	mut g, _ := parallel_worker_test_gen(true)
+	assert g.intern_string('source') == 0
+	g.str_lits_shared = true
+	// The queue handed chunks 1 and 3 to the first dispatcher, 0 and 2 to the second.
+	mut first := g.new_parallel_dispatch_worker(1)
+	mut second := g.new_parallel_dispatch_worker(2)
+	for chunk in [[1, 3], [0, 2]] {
+		mut dispatcher := if chunk[0] == 1 { first } else { second }
+		for chunk_idx in chunk {
+			mut batch := dispatcher.new_parallel_worker(chunk_idx)
+			id := batch.intern_string('chunk ${chunk_idx}')
+			shared_id := batch.intern_string('shared')
+			batch.sb.write_string('use(_str_${id}, _str_${shared_id});')
+			dispatcher.absorb_dispatch_chunk(batch, chunk_idx)
+		}
+	}
+	g.publish_dispatch_literals_in_chunk_order([voidptr(first), voidptr(second)])
+	mut ordered := []string{len: 4}
+	mut ordered_wrapper_defs := []ParallelChunkWrapperDefs{len: 4}
+	g.merge_parallel_worker_ordered(first, mut ordered, mut ordered_wrapper_defs)
+	g.merge_parallel_worker_ordered(second, mut ordered, mut ordered_wrapper_defs)
+	assert g.str_lits == ['source', 'chunk 0', 'shared', 'chunk 1', 'chunk 2', 'chunk 3']
+	assert ordered == ['use(_str_1, _str_2);', 'use(_str_3, _str_2);', 'use(_str_4, _str_2);',
+		'use(_str_5, _str_2);']
+}
+
+fn test_synthesized_string_literals_are_numbered_in_sorted_order() {
+	mut g, _ := parallel_worker_test_gen(false)
+	values := ['parsed b', 'parsed a', 'synthesized z', 'parsed a', 'synthesized c']
+	g.a.nodes = values.map(flat.Node{
+		kind:  .string_literal
+		value: it
+	})
+	g.a.parsed_node_count = 2
+	g.preintern_ast_string_literals()
+	assert g.str_lits == ['parsed b', 'parsed a', 'synthesized c', 'synthesized z']
+	// The collected literal table must give the same numbering as the node walk.
+	mut collected, _ := parallel_worker_test_gen(false)
+	collected.a.nodes = g.a.nodes
+	collected.a.parsed_node_count = 2
+	_ = collected.scan_collect_gen_info_serial()
+	collected.ast_string_literals_ready = true
+	assert collected.ast_string_literals_parsed == 2
+	collected.preintern_ast_string_literals()
+	assert collected.str_lits == g.str_lits
+}
+
+fn test_body_only_fn_ptr_typedefs_follow_the_type_declarations() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.used_fn_ptr_types['fn_ptr:int|int'] = true
+	g.split_body_fn_ptr_types_from_decls(min_flat_cgen_parallel_items)
+	assert g.split_body_fn_ptr_types
+	// Function bodies discover a type that the declarations never use.
+	g.used_fn_ptr_types['fn_ptr:i64|i64'] = true
+	g.fn_ptr_types['fn_ptr:int|int'] = '_fn_ptr_decl'
+	g.fn_ptr_types['fn_ptr:i64|i64'] = '_fn_ptr_body'
+	g.write_type_declaration_block()
+	out := g.sb.str()
+	decl := out.index('_fn_ptr_decl') or { -1 }
+	body := out.index('_fn_ptr_body') or { -1 }
+	// One sorted typedef group would put the `i64` signature first.
+	assert decl >= 0 && body > decl, out
+	assert !g.split_body_fn_ptr_types
+	assert g.used_fn_ptr_types['fn_ptr:i64|i64']
+	assert g.used_fn_ptr_types['fn_ptr:int|int']
+}
+
+fn test_type_metadata_scan_preserves_order_across_worker_shards() {
+	mut g, _ := parallel_worker_test_gen(false)
+	g.a.worker_pool = workers.new(4)
+	defer { g.a.worker_pool.close() }
+	g.a.nodes = []flat.Node{len: 65_540, init: flat.Node{ kind: .int_literal, value: '1' }}
+	// Place context markers and type sources on both sides of shard boundaries.
+	indices := [i32(0), 13_107, 13_108, 26_215, 26_216, 39_323, 39_324, 52_431, 52_432, 65_538,
+		65_539]
+	nodes := [
+		flat.Node{ kind: .file, value: 'first.v' },
+		flat.Node{ kind: .module_decl, value: 'first' },
+		flat.Node{ kind: .fn_decl, value: 'run' },
+		flat.Node{ kind: .param, typ: flat.source_type_id('Map_string_int') },
+		flat.Node{ kind: .call, typ: flat.source_type_id('?int') },
+		flat.Node{ kind: .decl_assign, value: 'shared' },
+		flat.Node{ kind: .ident, typ: flat.source_type_id('[4]int') },
+		flat.Node{ kind: .file, value: 'second.v' },
+		flat.Node{ kind: .module_decl, value: 'second' },
+		flat.Node{ kind: .cast_expr, value: '[2]string' },
+		flat.Node{ kind: .fn_literal, typ: flat.source_type_id('Map_string_string') },
+	]
+	for i, id in indices {
+		g.a.nodes[id] = nodes[i]
+	}
+	assert g.type_metadata_nodes() == indices
+	serial := g.scan_collect_gen_info(true)
+	assert g.type_metadata_nodes_ready
+	assert g.type_metadata_nodes() == indices
+	parallel := g.scan_collect_gen_info(false)
+	assert parallel == serial
+	assert g.type_metadata_nodes() == indices
+	w := g.new_parallel_worker(0)
+	assert w.type_metadata_nodes_ready
+	assert w.type_metadata_nodes() == indices
+	assert w.type_metadata_node_ids.data == g.type_metadata_node_ids.data
+}
+
+fn test_type_metadata_scan_handles_empty_index_and_rebuild() {
+	mut g, _ := parallel_worker_test_gen(false)
+	g.a.nodes = [flat.Node{ kind: .int_literal, value: '1' }]
+	g.scan_collect_gen_info(true)
+	assert g.type_metadata_nodes_ready
+	assert g.type_metadata_nodes().len == 0
+	g.a.add_node(flat.Node{ kind: .sizeof_expr, value: '[3]u8' })
+	g.scan_collect_gen_info(true)
+	assert g.type_metadata_nodes() == [i32(1)]
+}
+
+fn test_type_metadata_keeps_interface_boxes_without_array_scratch_types() {
+	mut g, _ := parallel_worker_test_gen(false)
+	// Interface dispatch examines struct initializers, but their temporary type
+	// text must not be treated as an authoritative fixed-array declaration.
+	g.a.nodes = [flat.Node{ kind: .struct_init, typ: flat.source_type_id('[8]int') }]
+	g.scan_collect_gen_info(true)
+	assert g.type_metadata_nodes() == [i32(0)]
+	assert g.collect_fixed_array_typedefs_needed().len == 0
+}
+
+fn test_type_metadata_text_cache_preserves_colliding_classifications() {
+	mut cache := &TypeMetadataTextCache{}
+	for text, expected in {
+		'':                  false
+		'[':                 false
+		'int':               false
+		'module.Type[':      false
+		'[]':                true
+		'map[string][4]int': true
+	} {
+		assert cache.may_need_array_typedef(text) == expected
+		assert cache.may_need_array_typedef(text) == expected
+	}
+	// Keep more distinct spellings live than the cache has slots, mixing hits
+	// and misses so collisions cannot retain another type's classification.
+	mut texts := []string{cap: 8192}
+	for i in 0 .. 8192 {
+		texts << if i % 2 == 0 { '[${i + 1}]int' } else { 'module.Type${i}' }
+	}
+	for _ in 0 .. 2 {
+		for i, text in texts {
+			assert cache.may_need_array_typedef(text) == (i % 2 == 0)
+		}
+	}
+}
+
+fn test_scoped_pre_dispatch_preserves_direct_array_access_flag() {
+	mut g, _ := parallel_worker_test_gen(true)
+	fn_id := g.a.add_node(flat.Node{
+		kind:  .fn_decl
+		value: 'unchecked_index'
+	})
+	g.fn_gen_items = [
+		FlatFnGenItem{
+			node_id:             fn_id
+			file:                'direct_array_access.v'
+			module:              'main'
+			c_name:              'main__unchecked_index'
+			cost:                1
+			direct_array_access: true
+			ignore_overflow:     true
+		},
+	]
+	g.prepare_pre_dispatch_master()
+	assert g.fn_gen_items.len == 1
+	assert g.fn_gen_items[0].direct_array_access
+	assert g.fn_gen_items[0].ignore_overflow
+	g.release_scoped_fn_items()
+}
+
+fn test_retained_selection_scope_does_not_own_scope_list() {
+	$if prealloc {
+		mut g, mut tc := parallel_worker_test_gen(true)
+		tc.building_v_fast = true
+		g.a.worker_pool = workers.new(8)
+		defer { g.a.worker_pool.close() }
+		for _ in 0 .. 2048 {
+			g.a.add_node(flat.Node{ kind: .module_decl, value: 'main' })
+		}
+		g.prepare_pre_dispatch_master()
+		assert g.parallel_worker_scopes.len > 1
+		for scope in g.parallel_worker_scopes {
+			assert !cgen_scope_owns(scope, g.parallel_worker_scopes.data)
+		}
+		g.free_parallel_worker_scopes()
+		assert g.parallel_worker_scopes.len == 0
+	}
+}
+
+fn test_parallel_generic_app_cache_uses_frozen_base_and_private_overlays() {
+	mut g, _ := parallel_worker_test_gen(true)
+	base, mut args, ok := g.shared_generic_app_parts(flat.source_type_id('Frozen[int]'))
+	assert ok
+	assert base == flat.source_type_id('Frozen')
+	assert args == [flat.source_type_int]
+	args[0] = flat.source_type_string
+	cached_base, mut cached_args, cached_ok := g.shared_generic_app_parts(flat.source_type_id('Frozen[int]'))
+	assert cached_ok && cached_base == base
+	assert cached_args == [flat.source_type_int]
+	cached_args[0] = flat.source_type_string
+	_, unchanged_args, _ := g.shared_generic_app_parts(flat.source_type_id('Frozen[int]'))
+	assert unchanged_args == [flat.source_type_int]
+	frozen := g.generic_app_cache
+
+	g.freeze_parallel_lookup_caches()
+	assert voidptr(g.generic_app_cache) != voidptr(frozen)
+	assert voidptr(g.generic_app_cache.base) == voidptr(frozen)
+
+	mut dispatcher := g.new_parallel_dispatch_worker(1)
+	assert voidptr(dispatcher.generic_app_cache) != voidptr(g.generic_app_cache)
+	assert voidptr(dispatcher.generic_app_cache.base) == voidptr(frozen)
+	mut batch := dispatcher.new_parallel_worker(0)
+	assert voidptr(batch.generic_app_cache) != voidptr(dispatcher.generic_app_cache)
+	assert voidptr(batch.generic_app_cache.base) == voidptr(frozen)
+
+	g.shared_generic_app_parts(flat.source_type_id('Shared[string]'))
+	dispatcher.shared_generic_app_parts(flat.source_type_id('Shared[string]'))
+	batch.shared_generic_app_parts(flat.source_type_id('Shared[string]'))
+	assert flat.source_type_id('Shared[string]') in g.generic_app_cache.entries
+	assert flat.source_type_id('Shared[string]') in dispatcher.generic_app_cache.entries
+	assert flat.source_type_id('Shared[string]') in batch.generic_app_cache.entries
+	assert flat.source_type_id('Shared[string]') !in frozen.entries
+}
+
+fn test_open_generic_receiver_template_bypasses_stale_generic_app_cache() {
+	mut g, _ := parallel_worker_test_gen(true)
+	mut cache := g.generic_app_cache
+	cache.entries[flat.source_type_id('AtomicVal[T]')] = GenericAppInfo{}
+	node := flat.Node{
+		kind:  .fn_decl
+		value: 'AtomicVal[T].load'
+	}
+	assert g.fn_node_is_open_generic_template(node, -1, 'stdatomic')
+	assert !g.should_emit_fn_node_in_module_known(node, -1, 'stdatomic', 'atomic.v', 'stdatomic__AtomicVal_T__load', true)
+}
+
+fn test_parallel_type_declarations_include_body_discovered_fn_ptr_types() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.parallel_type_decls = '/* precomputed type declarations */\n'.clone()
+	encoded := 'fn_ptr:int|int'
+	name := g.resolve_fn_ptr_type(encoded)
+
+	g.write_type_declaration_block()
+	source := g.sb.str()
+	precomputed_idx := source.index('/* precomputed type declarations */') or { -1 }
+	typedef_idx := source.index('typedef int (*${name})(int);') or { -1 }
+	assert precomputed_idx >= 0
+	assert typedef_idx > precomputed_idx
+	assert g.emitted_fn_ptr_typedefs[encoded]
+}
+
+fn test_parallel_type_declarations_preseed_function_type_aliases() {
+	mut g, mut tc := parallel_worker_test_gen(true)
+	tc.type_aliases.set_id(flat.source_type_id('Callback'), flat.source_type_id('fn (int)'))
+	callback_type := tc.parse_type(tc.type_aliases.value_id(flat.source_type_id('Callback')))
+	encoded := tc.c_type(callback_type)
+	assert encoded.starts_with('fn_ptr:')
+	assert encoded !in g.fn_ptr_types
+
+	g.preseed_type_alias_fn_ptr_types()
+	assert encoded in g.fn_ptr_types
+}
+
+fn test_dynamic_parallel_merge_preserves_chunk_order() {
+	mut g, _ := parallel_worker_test_gen(true)
+	mut first := g.new_parallel_dispatch_worker(1)
+	first.fn_segs = ['chunk-2;', 'chunk-0;']
+	first.fn_seg_chunk_indexes = [2, 0]
+	mut second := g.new_parallel_dispatch_worker(2)
+	second.fn_segs = ['chunk-3;', 'chunk-1;']
+	second.fn_seg_chunk_indexes = [3, 1]
+	mut ordered := []string{len: 4}
+	mut ordered_wrapper_defs := []ParallelChunkWrapperDefs{len: 4}
+
+	g.merge_parallel_worker_ordered(first, mut ordered, mut ordered_wrapper_defs)
+	g.merge_parallel_worker_ordered(second, mut ordered, mut ordered_wrapper_defs)
+	assert ordered == ['chunk-0;', 'chunk-1;', 'chunk-2;', 'chunk-3;']
+}
+
+fn test_dynamic_parallel_merge_replays_wrapper_defs_in_chunk_order() {
+	mut g, _ := parallel_worker_test_gen(true)
+	mut high := g.new_parallel_dispatch_worker(1)
+	high.fn_segs = ['chunk-3;', 'chunk-2;']
+	high.fn_seg_chunk_indexes = [3, 2]
+	high.parallel_chunk_wrapper_defs = [
+		ParallelChunkWrapperDefs{
+			chunk_idx: 3
+			spawn:     ['spawn-3-typedef;', 'spawn-3-trampoline;', 'spawn-shared;']
+			callback:  ['callback-3;']
+		},
+		ParallelChunkWrapperDefs{
+			chunk_idx: 2
+			spawn:     ['spawn-2-typedef;', 'spawn-2-trampoline;']
+			callback:  ['callback-2;']
+		},
+	]
+
+	mut low := g.new_parallel_dispatch_worker(2)
+	low.fn_segs = ['chunk-1;', 'chunk-0;']
+	low.fn_seg_chunk_indexes = [1, 0]
+	low.parallel_chunk_wrapper_defs = [
+		ParallelChunkWrapperDefs{
+			chunk_idx: 1
+			spawn:     ['spawn-1-typedef;', 'spawn-1-trampoline;']
+			callback:  ['callback-1;']
+		},
+		ParallelChunkWrapperDefs{
+			chunk_idx: 0
+			spawn:     ['spawn-0-typedef;', 'spawn-0-trampoline;', 'spawn-shared;']
+			callback:  ['callback-0;']
+		},
+	]
+
+	mut ordered := []string{len: 4}
+	mut ordered_wrapper_defs := []ParallelChunkWrapperDefs{len: 4}
+	g.merge_parallel_worker_ordered(high, mut ordered, mut ordered_wrapper_defs)
+	g.merge_parallel_worker_ordered(low, mut ordered, mut ordered_wrapper_defs)
+	g.replay_ordered_parallel_wrapper_defs(ordered_wrapper_defs)
+
+	assert ordered == ['chunk-0;', 'chunk-1;', 'chunk-2;', 'chunk-3;']
+	assert g.spawn_wrapper_defs == ['spawn-0-typedef;', 'spawn-0-trampoline;', 'spawn-shared;',
+		'spawn-1-typedef;', 'spawn-1-trampoline;', 'spawn-2-typedef;', 'spawn-2-trampoline;',
+		'spawn-3-typedef;', 'spawn-3-trampoline;']
+	assert g.callback_wrapper_defs == ['callback-0;', 'callback-1;', 'callback-2;', 'callback-3;']
+}
+
+fn test_dynamic_parallel_chunk_capture_keeps_deduplicated_wrapper_attempts() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.parallel_chunk_wrapper_defs << ParallelChunkWrapperDefs{
+		chunk_idx: 2
+	}
+	g.parallel_chunk_wrapper_capture = 0
+	g.add_spawn_wrapper_def('spawn-shared;')
+	g.add_spawn_wrapper_def('spawn-shared;')
+	g.add_callback_wrapper_def('callback-shared;')
+	g.add_callback_wrapper_def('callback-shared;')
+	g.parallel_chunk_wrapper_capture = -1
+
+	assert g.spawn_wrapper_defs == ['spawn-shared;']
+	assert g.callback_wrapper_defs == ['callback-shared;']
+	assert g.parallel_chunk_wrapper_defs[0].spawn == ['spawn-shared;', 'spawn-shared;']
+	assert g.parallel_chunk_wrapper_defs[0].callback == ['callback-shared;', 'callback-shared;']
+}
+
+fn test_parallel_capture_drop_wrappers_replay_by_symbol() {
+	mut g, _ := parallel_worker_test_gen(true)
+	g.parallel_chunk_wrapper_defs << ParallelChunkWrapperDefs{
+		chunk_idx: 0
+	}
+	g.parallel_chunk_wrapper_capture = 0
+	first := 'static void _flctxdrop_7(void* data) { for (int i0 = 0; i0 < 2; i0++) {} }'
+	repeated := 'static void _flctxdrop_7(void* data) { for (int i1 = 0; i1 < 2; i1++) {} }'
+	g.add_spawn_wrapper_def(first)
+	g.add_spawn_wrapper_def(repeated)
+	g.parallel_chunk_wrapper_capture = -1
+	assert g.spawn_wrapper_defs == [first]
+	assert g.parallel_chunk_wrapper_defs[0].spawn == [first, repeated]
+	mut merged := FlatGen.new()
+	merged.replay_ordered_parallel_wrapper_defs(g.parallel_chunk_wrapper_defs)
+	assert merged.spawn_wrapper_defs == [first]
+}
+
+fn test_parallel_workers_merge_capture_drop_wrappers_by_symbol() {
+	for ordered_merge in [false, true] {
+		mut g, _ := parallel_worker_test_gen(true)
+		mut first := g.new_parallel_dispatch_worker(1)
+		mut second := g.new_parallel_dispatch_worker(2)
+		first.parallel_chunk_wrapper_defs << ParallelChunkWrapperDefs{ chunk_idx: 0 }
+		second.parallel_chunk_wrapper_defs << ParallelChunkWrapperDefs{ chunk_idx: 1 }
+		first.parallel_chunk_wrapper_capture = 0
+		second.parallel_chunk_wrapper_capture = 0
+		shared := 'static void _flctxdrop_7(void* data) { for (int i0 = 0; i0 < 2; i0++) {} }'
+		first.add_spawn_wrapper_def(shared)
+		second.add_spawn_wrapper_def('static void _flctxdrop_7(void* data) { for (int i1 = 0; i1 < 2; i1++) {} }')
+		distinct := 'static void _flctxdrop_8(void* data) {}'
+		second.add_spawn_wrapper_def(distinct)
+		if ordered_merge {
+			mut ordered := []string{len: 2}
+			mut wrappers := []ParallelChunkWrapperDefs{len: 2}
+			g.merge_parallel_worker_ordered(second, mut ordered, mut wrappers)
+			g.merge_parallel_worker_ordered(first, mut ordered, mut wrappers)
+			g.replay_ordered_parallel_wrapper_defs(wrappers)
+		} else {
+			g.merge_parallel_worker(first)
+			g.merge_parallel_worker(second)
+		}
+		assert g.spawn_wrapper_defs == [shared, distinct]
+	}
+}
+
+// c_extern_forward_decls() runs inside a disposable worker in scoped mode, so the
+// worker must inherit the header/linkage state the emission rule reads. Without it
+// every `fn C.` declaration looks header backed and silently loses its prototype.
+fn test_scoped_c_extern_worker_inherits_header_and_linkage_state() {
+	mut g, _ := parallel_worker_test_gen(true)
+	linked_file := '/project/linked.c.v'
+	lib_file := '/project/lib_only.c.v'
+	header_file := '/project/wrapped.c.v'
+	g.note_c_flag_directive('linked', linked_file, '@VMODROOT/helper.o')
+	g.note_c_flag_directive('lib_only', lib_file, '-lfoo')
+	g.note_c_include_directive('wrapped', header_file)
+
+	mut worker := g.new_parallel_worker(8)
+	g.configure_c_extern_scan_worker(mut worker)
+
+	assert worker.should_emit_c_extern_decl_from_file('helper_fn', linked_file, 'linked')
+	assert worker.should_emit_c_extern_decl_from_file('foo_open', lib_file, 'lib_only')
+	assert !worker.should_emit_c_extern_decl_from_file('wrapped_fn', header_file, 'wrapped')
+}
+
+fn test_c_extern_scan_publication_owns_completed_refs_after_scope_free() {
+	mut g, _ := parallel_worker_test_gen(true)
+	scope := cgen_worker_scope_begin(true)
+	mut worker := g.new_parallel_worker(7)
+	worker.c_extern_refs['C.'.clone() + 'scoped_symbol'] = true
+	worker.c_extern_refs['disabled'.clone()] = false
+	worker.c_extern_refs_ready = true
+	cgen_worker_scope_leave(scope)
+	g.publish_c_extern_type_discoveries(worker)
+	assert g.c_extern_refs_ready
+	assert g.c_extern_refs == {
+		'C.scoped_symbol': true
+		'disabled':        false
+	}
+	// Neither the map backing nor its keys may belong to the scan arena.
+	worker.c_extern_refs['worker_only'] = true
+	worker.c_extern_refs['C.scoped_symbol'] = false
+	cgen_worker_scope_free(scope)
+	assert g.c_extern_refs['C.scoped_symbol']
+	assert 'worker_only' !in g.c_extern_refs
+	for name, _ in g.c_extern_refs {
+		assert name in ['C.scoped_symbol', 'disabled']
+	}
+	fork := g.new_parallel_worker(1)
+	assert fork.c_extern_refs_ready
+	assert fork.c_extern_refs_shared
+	assert fork.c_extern_refs == g.c_extern_refs
+}
+
+fn test_c_extern_scan_publication_only_freezes_complete_new_refs() {
+	mut g, _ := parallel_worker_test_gen(true)
+	mut worker := g.new_parallel_worker(7)
+	worker.c_extern_refs['incomplete'] = true
+	g.publish_c_extern_type_discoveries(worker)
+	assert !g.c_extern_refs_ready
+	assert g.c_extern_refs.len == 0
+	g.c_extern_refs['master'] = true
+	g.c_extern_refs_ready = true
+	worker.c_extern_refs_ready = true
+	g.publish_c_extern_type_discoveries(worker)
+	assert g.c_extern_refs == {
+		'master': true
+	}
+}
+
+fn test_scoped_c_extern_preseed_retains_selected_body_refs() {
+	mut g, _ := parallel_worker_test_gen(true)
+	base := g.a.add_node(flat.Node{ kind: .ident, value: 'C' })
+	selector_start := g.a.children.len
+	g.a.children << base
+	selector := g.a.add_node(flat.Node{
+		kind:           .selector
+		value:          'scoped_symbol'
+		children_start: i32(selector_start)
+		children_count: 1
+	})
+	body_start := g.a.children.len
+	g.a.children << selector
+	body := g.a.add_node(flat.Node{
+		kind:           .fn_decl
+		value:          'main'
+		children_start: i32(body_start)
+		children_count: 1
+	})
+	g.fn_gen_items = [FlatFnGenItem{ node_id: body, c_name: 'main__main' }]
+	g.preseed_c_extern_fn_ptr_types_scoped()
+	assert g.c_extern_refs_ready
+	assert g.c_extern_refs['C.scoped_symbol']
+	assert g.c_extern_refs['scoped_symbol']
+	assert g.c_extern_referenced_symbols() == g.c_extern_refs
+}
+
+fn test_parallel_workers_preserve_global_shared_storage_presence() {
+	for scoped in [false, true] {
+		mut g, _ := parallel_worker_test_gen(scoped)
+		assert !g.new_parallel_worker(1).global_shared_storage_present
+		g.declare_global_raw_type('app.slot', flat.source_type_id('shared int'))
+		for worker in [g.new_parallel_worker(1), g.new_parallel_tail_worker(2),
+			g.new_parallel_dispatch_worker(3)] {
+			assert worker.global_shared_storage_present
+			assert worker.global_raw_type_texts.type_id('app.slot')? == flat.source_type_id('shared int')
+		}
+	}
+}

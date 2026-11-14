@@ -1,0 +1,201 @@
+module transform
+
+import v.flat
+import v.types
+
+fn inferred_anonymous_struct_type_exists(tc &types.TypeChecker, name string) bool {
+	return flat.source_type_id(name) in tc.structs || tc.type_aliases.contains(flat.source_type_id(name)) || tc.sum_types.contains(flat.source_type_id(name))
+		|| flat.source_type_id(name) in tc.enum_names || flat.source_type_id(name) in tc.interface_names
+}
+
+// materialize_inferred_anonymous_structs_before_prepare gives unresolved
+// anonymous struct literals concrete types before reusable transform indexes
+// are built.
+pub fn materialize_inferred_anonymous_structs_before_prepare(mut a flat.FlatAst, tc &types.TypeChecker) bool {
+	mut t := new_transformer(mut a, tc, map[string]bool{})
+	return t.materialize_inferred_anonymous_structs()
+}
+
+// materialize_inferred_anonymous_structs gives a concrete declaration to an
+// inferred `struct { field: expression }` literal whose field expressions were
+// not syntactically typed by the parser. Semantic checking has resolved those
+// expressions by this point. Run this before parallel transform preparation,
+// then again after generic specialization for literals whose field types only
+// become concrete in a cloned body.
+fn (mut t Transformer) materialize_inferred_anonymous_structs() bool {
+	if isnil(t.tc) {
+		return false
+	}
+	t.tc.ensure_private_transform_structs()
+	mut materialized := false
+	mut union_map_detached := false
+	mut inferred_by_shape := map[string]u32{}
+	original_node_count := t.a.nodes.len
+	// Find the candidates on the pool; the loop below still checks each one.
+	mut candidate_flags := []u8{len: original_node_count}
+	use_flags := scan_anonymous_struct_init_flags_parallel(t.a, original_node_count, mut
+		candidate_flags)
+	mut idx := -1
+	for {
+		idx++
+		if use_flags && idx < original_node_count {
+			found := unsafe { &u8(C.memchr(&u8(candidate_flags.data) + idx, 1, uint(original_node_count - idx))) }
+			idx = if isnil(found) {
+				original_node_count
+			} else {
+				int(unsafe { found - &u8(candidate_flags.data) })
+			}
+		}
+		if idx >= original_node_count {
+			break
+		}
+		if t.a.nodes[idx].kind != .struct_init || t.a.nodes[idx].source_value_id() !in [
+			flat.source_type_id('struct'),
+			transform_source_type_union,
+		]
+			|| (t.a.nodes[idx].children_count == 0
+				&& t.a.nodes[idx].source_value_id() != transform_source_type_union) {
+			continue
+		}
+		// Materialization appends nodes, so keep a copy of this candidate.
+		node := t.a.nodes[idx]
+		is_union := node.source_value_id() == transform_source_type_union
+		match node.kind {
+			.struct_init {
+				source_file := t.a.source_files[node.pos.id] or { continue }
+				cur_file := source_file.name
+				cur_module := t.tc.file_modules[cur_file] or { '' }
+				// Contextual checking may already have selected one of the declared
+				// anonymous structs with this field shape. Keep that nominal identity;
+				// transform_struct_init will apply it when this literal is lowered.
+				if checked_type := t.tc.expr_type(flat.NodeId(idx)) {
+					if transform_is_anonymous_struct_name(checked_type.source_type_id()) {
+						continue
+					}
+				}
+				mut semantic_fields := []types.StructField{cap: int(node.children_count)}
+				mut valid := true
+				for fi in 0 .. node.children_count {
+					field := t.a.child_node(&node, fi)
+					if field.kind != .field_init || field.value.len == 0
+						|| field.children_count != 1 {
+						valid = false
+						break
+					}
+					value_id := t.a.child(field, 0)
+					field_type := t.tc.expr_type(value_id) or { t.tc.resolve_type(value_id) }
+					field_type_id := t.tc.type_name(field_type)
+					if field_type is types.Unknown || field_type is types.Void
+						|| field_type_id in [u32(0), flat.source_type_unknown, flat.source_type_void,
+							transform_source_type_struct, transform_source_type_union] {
+						valid = false
+						break
+					}
+					semantic_fields << types.StructField{
+						name: field.value
+						typ:  field_type
+					}
+				}
+				if !valid {
+					continue
+				}
+				mut shape_parts := []string{cap: semantic_fields.len}
+				for semantic_field in semantic_fields {
+					field_type_id := t.tc.type_name(semantic_field.typ)
+					shape_parts << '${semantic_field.name.len}:${semantic_field.name}:${field_type_id}'
+				}
+				shape := if is_union {
+					'union:${cur_module.len}:${cur_module}:${shape_parts.join(',')}'
+				} else {
+					'${cur_module.len}:${cur_module}:${shape_parts.join(',')}'
+				}
+				if semantic_name_id := inferred_by_shape[shape] {
+					t.a.nodes[idx].set_value_text(flat.source_type_name(flat.source_type_syntax(semantic_name_id).unqualified()))
+					t.a.nodes[idx].typ = semantic_name_id
+					t.mark_scoped_owned_base_node(idx)
+					t.tc.register_synth_type(flat.NodeId(idx), types.Struct{
+						name_id: semantic_name_id
+					})
+					continue
+				}
+				mut field_ids := []flat.NodeId{cap: semantic_fields.len}
+				for fi, semantic_field in semantic_fields {
+					source_field := t.a.child_node(&node, fi)
+					field_ids << t.a.add_node(flat.Node{
+						kind:  .field_decl
+						value: semantic_field.name
+						typ:   t.tc.type_name(semantic_field.typ)
+						pos:   source_field.pos
+					})
+				}
+				base_name := if is_union {
+					'AnonUnion_v3_inferred_${idx}'
+				} else {
+					'AnonStruct_v3_inferred_${idx}'
+				}
+				mut name := base_name
+				mut semantic_name := name
+				if cur_module.len > 0 && cur_module !in ['main', 'builtin'] {
+					semantic_name = '${cur_module}.${name}'
+				}
+				mut collision_suffix := 1
+				for inferred_anonymous_struct_type_exists(t.tc, semantic_name) {
+					name = '${base_name}_${collision_suffix}'
+					semantic_name = name
+					if cur_module.len > 0 && cur_module !in ['main', 'builtin'] {
+						semantic_name = '${cur_module}.${name}'
+					}
+					collision_suffix++
+				}
+				if cur_file.len > 0 {
+					t.a.add_node(flat.Node{
+						kind:  .file
+						value: cur_file
+					})
+				}
+				if cur_module.len > 0 {
+					t.a.add_node(flat.Node{
+						kind:  .module_decl
+						value: cur_module
+					})
+				}
+				children_start := t.a.children.len
+				for field_id in field_ids {
+					t.a.children << field_id
+				}
+				t.a.add_node(flat.Node{
+					kind:           .struct_decl
+					value:          name
+					typ:            if is_union { transform_source_type_union } else { u32(0) }
+					children_start: children_start
+					children_count: flat.child_count(field_ids.len)
+					pos:            node.pos
+				})
+				semantic_name_id := flat.source_type_id(semantic_name)
+				if is_union {
+					if !union_map_detached {
+						t.tc.unions = t.tc.unions.clone()
+						t.a.synthesized_anon_struct_types = t.a.synthesized_anon_struct_types.clone()
+						union_map_detached = true
+					}
+					t.tc.unions[semantic_name_id] = true
+					t.a.synthesized_anon_struct_types[flat.source_type_syntax(semantic_name_id).unqualified()] = true
+				}
+				t.tc.structs[semantic_name_id] = semantic_fields
+				t.tc.struct_modules[semantic_name_id] = cur_module
+				t.tc.struct_files[semantic_name_id] = cur_file
+				t.tc.register_short_type_name(semantic_name_id)
+				inferred_by_shape[shape] = semantic_name_id
+				t.a.nodes[idx].set_value_text(name)
+				t.a.nodes[idx].typ = semantic_name_id
+				t.mark_scoped_owned_base_node(idx)
+				t.tc.register_synth_type(flat.NodeId(idx), types.Struct{
+					name_id: semantic_name_id
+				})
+				materialized = true
+			}
+			else {}
+		}
+	}
+	return materialized
+}

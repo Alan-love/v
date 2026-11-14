@@ -1,0 +1,1065 @@
+module c
+
+import v.flat
+import v.types
+
+fn stmt_test_node(mut a flat.FlatAst, kind flat.NodeKind, value string, children []flat.NodeId) flat.NodeId {
+	start := a.children.len
+	a.children << children
+	return a.add_node(flat.Node{
+		kind:           kind
+		value:          value
+		children_start: i32(start)
+		children_count: flat.child_count(children.len)
+	})
+}
+
+fn stmt_test_prefix(mut a flat.FlatAst, op flat.Op, child flat.NodeId) flat.NodeId {
+	start := a.children.len
+	a.children << child
+	return a.add_node(flat.Node{
+		kind:           .prefix
+		op:             op
+		children_start: i32(start)
+		children_count: 1
+	})
+}
+
+fn test_inline_asm_quoted_label_references_drop_v_quotes() {
+	assert lower_c_inline_asm_template("jz '1f'", 'amd64', map[string]bool{}, false) == 'jz 1f'
+	assert lower_c_inline_asm_template("jnz '23b'", 'amd64', map[string]bool{}, false) == 'jnz 23b'
+	assert lower_c_inline_asm_template("call 'named_target'", 'amd64', map[string]bool{}, false) == 'call named_target'
+	assert lower_c_inline_asm_template("jmp 'next_block'", 'i386', map[string]bool{}, false) == 'jmp next_block'
+	assert lower_c_inline_asm_template("jmp 'x'", 'amd64', map[string]bool{}, false) == 'jmp x'
+}
+
+fn test_inline_asm_quoted_numbered_operands_drop_v_quotes() {
+	assert lower_c_inline_asm_template("lock cmpxchgq '%1', '%2'", 'amd64', map[string]bool{}, true) == 'lock cmpxchgq %2, %1'
+}
+
+fn test_inline_asm_character_tokens_use_assembly_quotes() {
+	aliases := map[string]bool{}
+	assert lower_c_inline_asm_template('mov rax, `A`', 'amd64', aliases, false) == "mov \$'A', %rax"
+	assert lower_c_inline_asm_template('mov rax, `,`', 'amd64', aliases, false) == "mov \$',', %rax"
+	assert lower_c_inline_asm_template('mov eax, `A`', 'i386', aliases, false) == "mov \$'A', %eax"
+	assert lower_c_inline_asm_template('.byte `A`', 'amd64', aliases, false) == ".byte 'A'"
+	assert lower_c_inline_asm_template('mov x0, `A`', 'arm64', aliases, false) == "mov x0, 'A'"
+	assert lower_c_inline_asm_template('mov x0, `A`', 'aarch64', aliases, false) == "mov x0, 'A'"
+	assert lower_c_inline_asm_intel_template('mov rax, `A`', aliases, false) == "mov rax, 'A'"
+}
+
+fn test_inline_asm_aarch64_alias_uses_arm64_operand_lowering() {
+	aliases := {
+		'data':         true
+		'raw_metadata': true
+		'address':      true
+	}
+	assert lower_c_inline_asm_template('ldp data, raw_metadata, [address]', 'aarch64',
+		aliases, true) == 'ldp %[data], %[raw_metadata], [%[address]]'
+	assert lower_c_inline_asm_template('add data, data, 1', 'aarch64', aliases, true) ==
+		'add %[data], %[data], #1'
+}
+
+fn test_inline_asm_riscv64_preserves_operand_order_and_registers() {
+	aliases := {
+		'value': true
+		'input': true
+	}
+	for arch in ['rv64', 'riscv64'] {
+		assert lower_c_inline_asm_template('addi value, input, 5', arch, aliases, true) ==
+			'addi %[value], %[input], 5'
+		assert lower_c_inline_asm_template('fadd.d f0, f1, f31', arch, aliases, true) ==
+			'fadd.d f0, f1, f31'
+		assert lower_c_inline_asm_template("add '%0', '%1', '%2'", arch, aliases, true) ==
+			'add %0, %1, %2'
+		assert lower_c_inline_asm_template("beq zero, zero, '1f'", arch, aliases, true) ==
+			'beq zero, zero, 1f'
+	}
+}
+
+fn test_inline_asm_riscv64_lowers_memory_operands() {
+	aliases := {
+		'address': true
+	}
+	for arch in ['rv64', 'riscv64'] {
+		assert lower_c_inline_asm_template('sd t0, [address]', arch, aliases, true) ==
+			'sd t0, (%[address])'
+		assert lower_c_inline_asm_template('ld t0, [address + 8]', arch, aliases, true) ==
+			'ld t0, 8(%[address])'
+		assert lower_c_inline_asm_template('ld t0, [address + -8]', arch, aliases, true) ==
+			'ld t0, -8(%[address])'
+	}
+}
+
+fn test_inline_asm_x86_addresses_preserve_unscaled_indexes() {
+	aliases := map[string]bool{}
+	assert lower_c_inline_asm_template('mov rax, [rbx + rcx + 8]', 'amd64', aliases, false) == 'mov 8(%rbx, %rcx, 1), %rax'
+	assert lower_c_inline_asm_template('mov eax, [ebx + ecx + 4]', 'i386', aliases, false) == 'mov 4(%ebx, %ecx, 1), %eax'
+	assert lower_c_inline_asm_template('lea rax, [rip + named_target]', 'amd64', aliases, false) == 'lea named_target(%rip), %rax'
+}
+
+fn test_inline_asm_i386_uses_x86_att_operand_lowering() {
+	aliases := map[string]bool{}
+	assert lower_c_inline_asm_template('mov eax, ebx', 'i386', aliases, false) == 'mov %ebx, %eax'
+	assert lower_c_inline_asm_template('mov eax, 7', 'i386', aliases, false) == 'mov \$7, %eax'
+	assert lower_c_inline_asm_template('mov eax, [ebx + ecx*4 + 8]', 'i386', aliases, false) == 'mov 8(%ebx, %ecx, 4), %eax'
+}
+
+fn test_inline_asm_x86_register_branch_targets_are_indirect() {
+	aliases := {
+		'callback': true
+	}
+	assert lower_c_inline_asm_template('call rax', 'amd64', aliases, false) == 'call *%rax'
+	assert lower_c_inline_asm_template('call rax', 'amd64', aliases, true) == 'call *%%rax'
+	assert lower_c_inline_asm_template('jmp callback', 'amd64', aliases, true) == 'jmp *%[callback]'
+	assert lower_c_inline_asm_template('jmp eax', 'i386', aliases, false) == 'jmp *%eax'
+	assert lower_c_inline_asm_template("call 'named_target'", 'amd64', aliases, false) == 'call named_target'
+}
+
+fn test_inline_asm_directional_numeric_labels_use_gnu_order() {
+	aliases := map[string]bool{}
+	assert lower_c_inline_asm_template('jmp b1', 'amd64', aliases, false) == 'jmp 1b'
+	assert lower_c_inline_asm_template('jnz f42', 'amd64', aliases, false) == 'jnz 42f'
+	assert lower_c_inline_asm_intel_template('jmp b3', aliases, false) == 'jmp 3b'
+}
+
+fn test_inline_asm_block_comments_do_not_create_operand_sections() {
+	source := 'mov rax, "/* ; quoted */"
+/* outer ; /* nested ; */ still a comment ; */
+mov rbx, "// ; quoted"
+// line comment ;
+; +r (value)'
+	clean := strip_c_inline_asm_comments(source)
+	assert clean.contains('"/* ; quoted */"')
+	assert clean.contains('"// ; quoted"')
+	assert !clean.contains('outer')
+	assert !clean.contains('line comment')
+	sections := split_c_inline_asm_sections(clean)
+	assert sections.len == 2
+	assert sections[0].split_into_lines().filter(it.trim_space().len > 0) == [
+		'mov rax, "/* ; quoted */"',
+		'mov rbx, "// ; quoted"',
+	]
+	assert sections[1].trim_space() == '+r (value)'
+}
+
+fn test_lowered_storage_dereference_prefers_annotated_pointer_type() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	pointer_type := types.Type(types.Pointer{
+		base_type: &types.Type(types.int_)
+	})
+	value_id := stmt_test_node(mut a, .ident, 'value', [])
+	tc.register_synth_type(value_id, pointer_type)
+	children_start := a.children.len
+	a.children << value_id
+	deref_id := a.add_node(flat.Node{
+		kind:           .prefix
+		op:             .mul
+		typ:            flat.source_type_id('&int')
+		children_start: i32(children_start)
+		children_count: 1
+	})
+
+	actual := g.usable_expr_type(deref_id)
+	assert actual is types.Pointer
+	if actual is types.Pointer {
+		assert *actual.base_type == types.Type(types.int_)
+	}
+}
+
+fn test_primitive_fixed_array_zero_initializer_is_compact() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+
+	large := types.ArrayFixed{
+		elem_type: &types.Type(types.u8_)
+		len:       65536
+	}
+	assert g.empty_fixed_array_initializer_string(large) == '{0}'
+
+	nested := types.ArrayFixed{
+		elem_type: &types.Type(types.ArrayFixed{
+			elem_type: &types.Type(types.i32_)
+			len:       32
+		})
+		len:       32
+	}
+	assert g.empty_fixed_array_initializer_string(nested) == '{0}'
+
+	dynamic_arrays := types.ArrayFixed{
+		elem_type: &types.Type(types.Array{
+			elem_type: &types.Type(types.int_)
+		})
+		len:       2
+	}
+	dynamic_init := g.empty_fixed_array_initializer_string(dynamic_arrays)
+	assert dynamic_init.count('__new_array_noscan(') == 2
+}
+
+fn test_fixed_array_optional_abi_conversions_use_memcpy() {
+	fixed := types.Type(types.ArrayFixed{
+		elem_type: &types.Type(types.int_)
+		len:       2
+	})
+	mut forward_gen := FlatGen.new()
+	forward := forward_gen.optional_forward_return_abi_wrap_expr('__v_option_source', '__v_option_destination', fixed, 'source()')
+	assert forward.contains('if (_t1.ok) { memcpy(_t2.value, _t1.value, sizeof(_t2.value)); }'), forward
+	assert !forward.contains('.value = _t1.value'), forward
+}
+
+fn test_ownership_recursive_drop_helpers_deduplicate_emitted_c_symbol() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	// Distinct logical ownership keys can refer to the same runtime struct after
+	// lifetime erasure. Only one C helper definition may be emitted for it.
+	g.recursive_drop_helpers[ownership_drop_expansion_key(types.Type(types.Struct{
+		name_id: flat.source_type_id('pkg.Sink[^p,^s,Writer]')
+	}))] = flat.source_type_id('pkg.Sink[Writer]')
+	g.recursive_drop_helpers[ownership_drop_expansion_key(types.Type(types.Struct{
+		name_id: flat.source_type_id('pkg.Sink[^s,^s,Writer]')
+	}))] = flat.source_type_id('pkg.Sink[Writer]')
+	g.gen_ownership_recursive_drop_helpers()
+	assert g.sb.str().count('static void __v3_ownership_drop_pkg__Sink_Writer(') == 1
+}
+
+fn test_usable_resolved_sum_type_requires_exact_qualified_name() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	tc.sum_types.set(flat.source_type_id('bar.Result'), ['bar.Failed', 'bar.Ok'])
+	tc.sum_types.set(flat.source_type_id('foo.Choice'), ['foo.Left', 'foo.Right'])
+	mut g := FlatGen.new()
+	g.tc = &tc
+	g.precompute_sum_name_lookup()
+
+	preserved := g.usable_resolved_sum_type(types.Type(types.Struct{
+		name_id: flat.source_type_id('foo.Result')
+	}))
+	assert preserved is types.Struct
+	if preserved is types.Struct {
+		assert preserved.name() == 'foo.Result'
+	}
+
+	exact := g.usable_resolved_sum_type(types.Type(types.Struct{
+		name_id: flat.source_type_id('foo.Choice')
+	}))
+	assert exact is types.SumType
+	if exact is types.SumType {
+		assert exact.name() == 'foo.Choice'
+	}
+}
+
+fn test_fixed_array_address_to_byte_pointer_decl_uses_data_pointer() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	fixed_type := types.Type(types.ArrayFixed{
+		elem_type: &types.Type(types.u8_)
+		len:       2
+	})
+	byte_pointer := types.Type(types.Pointer{
+		base_type: &types.Type(types.u8_)
+	})
+	tc.push_scope()
+	tc.cur_scope.insert('buf', fixed_type)
+	buf_id := stmt_test_node(mut a, .ident, 'buf', [])
+	rhs_id := stmt_test_prefix(mut a, .amp, buf_id)
+	g.gen_decl_init_expr(rhs_id, a.nodes[int(rhs_id)], byte_pointer, 'u8*', true, '')
+	assert g.sb.str() == '((u8*)(buf))'
+	fixed_pointer := types.Type(types.Pointer{
+		base_type: &types.Type(fixed_type)
+	})
+	mut assign_gen := FlatGen.new()
+	assign_gen.a = &a
+	assign_gen.tc = &tc
+	p_id := stmt_test_node(mut a, .ident, 'p', [])
+	assert assign_gen.gen_fixed_array_address_to_byte_pointer_assign(p_id, rhs_id, byte_pointer, fixed_pointer)
+	assert assign_gen.sb.str() == 'p = ((u8*)(buf));\n'
+	int_fixed_type := types.Type(types.ArrayFixed{
+		elem_type: &types.Type(types.i32_)
+		len:       2
+	})
+	tc.cur_scope.insert('int_buf', int_fixed_type)
+	int_buf_id := stmt_test_node(mut a, .ident, 'int_buf', [])
+	int_rhs_id := stmt_test_prefix(mut a, .amp, int_buf_id)
+	int_fixed_pointer := types.Type(types.Pointer{
+		base_type: &types.Type(int_fixed_type)
+	})
+	mut rejected_gen := FlatGen.new()
+	rejected_gen.a = &a
+	rejected_gen.tc = &tc
+	assert !rejected_gen.gen_fixed_array_address_to_byte_pointer_assign(p_id, int_rhs_id, byte_pointer, int_fixed_pointer)
+	assert rejected_gen.sb.str() == ''
+	tc.pop_scope()
+}
+
+fn test_mut_parameter_power_assign_uses_scalar_result_type() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	int_type := types.Type(types.int_)
+	ptr_type := types.Type(types.Pointer{
+		base_type: &types.Type(int_type)
+	})
+
+	tc.push_scope()
+	arg_owner := tc.cur_scope.insert_with_owner('arg', ptr_type)
+	g.cur_param_types['arg'] = tc.intern_type_reference(ptr_type)
+	g.cur_mut_params['arg'] = true
+	g.cur_mut_param_owners['arg'] = arg_owner
+	arg_id := stmt_test_node(mut a, .ident, 'arg', [])
+	exponent_id := stmt_test_node(mut a, .int_literal, '2', [])
+	children_start := a.children.len
+	a.children << arg_id
+	a.children << exponent_id
+	g.gen_assign(flat.Node{
+		kind:           .assign
+		op:             .power_assign
+		children_start: i32(children_start)
+		children_count: 2
+	})
+	compact := g.sb.str().replace('\t', '').replace(' ', '').replace('\n', '')
+	assert compact.contains('*arg=((i64)__v_pow_i64('), compact
+	assert !compact.contains('(i64*)__v_pow_i64('), compact
+	tc.pop_scope()
+}
+
+fn test_local_pointer_alias_clear_preserves_outer_branch_markers() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.tc = &tc
+	ptr_type := types.Type(types.Pointer{
+		base_type: &types.Type(types.int_)
+	})
+
+	tc.push_scope()
+	outer_owner := tc.cur_scope.insert_with_owner('p', ptr_type)
+	g.declare_local_pointer_alias_source(outer_owner, 'x')
+	assert g.local_pointer_alias_assignment_can_clear(outer_owner)
+
+	tc.push_scope()
+	g.enter_conditional_branch(true)
+	assert !g.local_pointer_alias_assignment_can_clear(outer_owner)
+
+	branch_owner := tc.cur_scope.insert_with_owner('q', ptr_type)
+	g.declare_local_pointer_alias_source(branch_owner, 'y')
+	assert g.local_pointer_alias_assignment_can_clear(branch_owner)
+
+	tc.push_scope()
+	assert g.local_pointer_alias_assignment_can_clear(branch_owner)
+	nested_owner := tc.cur_scope.insert_with_owner('r', ptr_type)
+	g.declare_local_pointer_alias_source(nested_owner, 'z')
+	assert g.local_pointer_alias_assignment_can_clear(nested_owner)
+	tc.pop_scope()
+
+	g.leave_conditional_branch()
+	tc.pop_scope()
+
+	g.enter_conditional_branch(false)
+	assert !g.local_pointer_alias_assignment_can_clear(outer_owner)
+	g.leave_conditional_branch()
+
+	assert g.local_pointer_alias_assignment_can_clear(outer_owner)
+	tc.pop_scope()
+}
+
+fn test_fn_decl_signature_registration_preserves_call_name_aliases() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	tc.cur_module = 'pkg'
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	name := 'Widget.call'
+	full_name := qualify_name_in_module(tc.cur_module, name)
+	params := [types.Type(types.int_)]
+	shared_flags := [true]
+	g.register_fn_decl_signature(name, full_name, params, shared_flags, true, true, flat.source_type_int)
+	aliases := [
+		fn_decl_module_key(tc.cur_module, name),
+		name,
+		g.cname(name),
+		'${tc.cur_module}.${name}',
+		g.cname('${tc.cur_module}.${name}'),
+	]
+	for alias in aliases {
+		assert g.fn_decl_param_types[alias] == params
+		result := g.fn_decl_ret_types[alias] or { types.empty_type }
+		assert voidptr(result) == voidptr(tc.parse_type(flat.source_type_id('int')))
+		assert g.fn_decl_variadic[alias]
+		if alias != fn_decl_module_key(tc.cur_module, name) {
+			assert g.fn_decl_shared_params[alias] == shared_flags
+			assert g.fn_decl_mut_receivers[alias]
+		}
+	}
+}
+
+fn test_signature_preparation_shares_unchanged_parameter_storage() {
+	mut a := flat.FlatAst.new()
+	parameter := a.add_node(flat.Node{
+		kind:  .param
+		value: 'value'
+		typ:   flat.source_type_id('int')
+	})
+	body := a.add_node(flat.Node{ kind: .empty })
+	a.children << parameter
+	for _ in 0 .. 128 {
+		a.children << body
+	}
+	node := flat.Node{
+		kind:           .fn_decl
+		value:          'work'
+		typ:            flat.source_type_id('void')
+		children_count: 129
+	}
+	mut tc := types.TypeChecker.new(&a)
+	params := [types.Type(types.int_)]
+	tc.fn_param_types['work'] = params
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	first := g.compute_collect_gen_fn_prep(node, 'main', '')
+	assert first.ptypes == params
+	assert first.ptypes.data == params.data
+
+	a.nodes[int(parameter)].typ = flat.source_type_id('&int')
+	a.nodes[int(parameter)].is_mut = true
+	a.nodes[int(parameter)].op = .amp
+	pointers := [*tc.parse_type(flat.source_type_id('&int'))]
+	tc.fn_param_types['work'] = pointers
+	changed := g.compute_collect_gen_fn_prep(node, 'main', '')
+	assert changed.ptypes.len == 1
+	assert changed.ptypes[0].name() == '&&int'
+	assert pointers[0].name() == '&int'
+	assert changed.ptypes.data != pointers.data
+}
+
+fn test_same_named_fn_signatures_are_resolved_in_the_current_module() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	main_params := [types.Type(types.int_)]
+	tc.cur_module = 'main'
+	g.register_fn_decl_signature_type('make', 'make', main_params, []bool{}, false, false,
+		types.Type(types.int_))
+	tc.cur_module = 'builtin'
+	g.register_fn_decl_signature_type('make', 'make', []types.Type{}, []bool{}, false,
+		false, types.Type(types.string_))
+
+	tc.cur_module = 'main'
+	assert g.param_types_for('make', 'make') == main_params
+	assert g.fn_decl_return_type_for_call_name('make') or { types.Type(types.void_) } == types.Type(types.int_)
+	tc.cur_module = 'builtin'
+	assert g.param_types_for('make', 'make') == []
+	assert g.fn_decl_return_type_for_call_name('make') or { types.Type(types.void_) } == types.Type(types.string_)
+}
+
+fn test_local_pointer_alias_branch_assignment_merges_outer_markers() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	int_type := types.Type(types.int_)
+	ptr_type := types.Type(types.Pointer{
+		base_type: &types.Type(int_type)
+	})
+
+	tc.push_scope()
+	tc.cur_scope.insert_with_owner('x', int_type)
+	arg_owner := tc.cur_scope.insert_with_owner('arg', int_type)
+	g.cur_mut_params['arg'] = true
+	g.cur_mut_param_owners['arg'] = arg_owner
+	p_owner := tc.cur_scope.insert_with_owner('p', ptr_type)
+	g.declare_local_pointer_alias_source(p_owner, 'x')
+
+	tc.push_scope()
+	g.enter_conditional_branch(true)
+	arg_id := stmt_test_node(mut a, .ident, 'arg', [])
+	amp_arg := stmt_test_prefix(mut a, .amp, arg_id)
+	g.track_local_pointer_alias_assign(flat.Node{
+		kind:  .ident
+		value: 'p'
+	}, amp_arg)
+	assert g.local_pointer_alias_source('p') or { '' } == 'x'
+	assert !g.local_pointer_alias_source_is_mut_param('p')
+	g.leave_conditional_branch()
+	tc.pop_scope()
+
+	maybe_owner := tc.cur_scope.insert_with_owner('maybe', ptr_type)
+	tc.push_scope()
+	g.enter_conditional_branch(true)
+	x_id := stmt_test_node(mut a, .ident, 'x', [])
+	amp_x := stmt_test_prefix(mut a, .amp, x_id)
+	g.track_local_pointer_alias_assign(flat.Node{
+		kind:  .ident
+		value: 'maybe'
+	}, amp_x)
+	assert g.local_pointer_alias_source('maybe') or { '' } == ''
+	assert !g.local_pointer_alias_assignment_can_clear(maybe_owner)
+	g.leave_conditional_branch()
+	tc.pop_scope()
+
+	g.declare_local_pointer_alias_source_kind(p_owner, 'arg', true)
+	tc.push_scope()
+	g.enter_conditional_branch(true)
+	g.track_local_pointer_alias_assign(flat.Node{
+		kind:  .ident
+		value: 'p'
+	}, amp_x)
+	assert g.local_pointer_alias_source('p') or { '' } == 'arg'
+	assert !g.local_pointer_alias_source_is_mut_param('p')
+	g.leave_conditional_branch()
+	tc.pop_scope()
+	tc.pop_scope()
+}
+
+fn test_local_pointer_alias_branch_assignment_without_outer_marker_stays_conditional() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	int_type := types.Type(types.int_)
+	ptr_type := types.Type(types.Pointer{
+		base_type: &types.Type(int_type)
+	})
+
+	tc.push_scope()
+	tc.cur_scope.insert_with_owner('x', int_type)
+	tc.cur_scope.insert_with_owner('p', ptr_type)
+	tc.push_scope()
+	g.enter_conditional_branch(true)
+	x_id := stmt_test_node(mut a, .ident, 'x', [])
+	amp_x := stmt_test_prefix(mut a, .amp, x_id)
+	g.track_local_pointer_alias_assign(flat.Node{
+		kind:  .ident
+		value: 'p'
+	}, amp_x)
+	assert g.local_pointer_alias_source('p') or { '' } == ''
+	assert !g.local_pointer_alias_source_is_mut_param('p')
+	g.leave_conditional_branch()
+	tc.pop_scope()
+	tc.pop_scope()
+}
+
+fn test_pointer_alias_stack_source_propagates_identifier_aliases() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	int_type := types.Type(types.int_)
+	ptr_type := types.Type(types.Pointer{
+		base_type: &types.Type(int_type)
+	})
+
+	tc.push_scope()
+	tc.cur_scope.insert_with_owner('x', int_type)
+	p_owner := tc.cur_scope.insert_with_owner('p', ptr_type)
+	x_id := stmt_test_node(mut a, .ident, 'x', [])
+	amp_x := stmt_test_prefix(mut a, .amp, x_id)
+	g.track_local_pointer_alias_source(flat.Node{
+		kind:  .ident
+		value: 'p'
+	}, p_owner, amp_x, ptr_type)
+	assert g.local_pointer_alias_source('p') or { '' } == 'x'
+	assert !g.local_pointer_alias_source_is_mut_param('p')
+
+	q_owner := tc.cur_scope.insert_with_owner('q', ptr_type)
+	p_id := stmt_test_node(mut a, .ident, 'p', [])
+	g.track_local_pointer_alias_source(flat.Node{
+		kind:  .ident
+		value: 'q'
+	}, q_owner, p_id, ptr_type)
+	assert g.local_pointer_alias_source('q') or { '' } == 'x'
+	assert !g.local_pointer_alias_source_is_mut_param('q')
+
+	assigned_owner := tc.cur_scope.insert_with_owner('assigned', ptr_type)
+	g.declare_local_pointer_alias_source(assigned_owner, '')
+	g.track_local_pointer_alias_assign(flat.Node{
+		kind:  .ident
+		value: 'assigned'
+	}, p_id)
+	assert g.local_pointer_alias_source('assigned') or { '' } == 'x'
+
+	mut_owner := tc.cur_scope.insert_with_owner('mut_alias', ptr_type)
+	g.declare_local_pointer_alias_source_kind(mut_owner, 'x', true)
+	mut_id := stmt_test_node(mut a, .ident, 'mut_alias', [])
+	mut_copy_owner := tc.cur_scope.insert_with_owner('mut_copy', ptr_type)
+	g.track_local_pointer_alias_source(flat.Node{
+		kind:  .ident
+		value: 'mut_copy'
+	}, mut_copy_owner, mut_id, ptr_type)
+	assert g.local_pointer_alias_source('mut_copy') or { '' } == 'x'
+	assert g.local_pointer_alias_source_is_mut_param('mut_copy')
+	tc.pop_scope()
+}
+
+fn test_heap_local_memdup_expr_uses_aligned_memdup_for_aligned_structs() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.tc = &tc
+	g.register_struct_decl_info('Aligned', 'Aligned', 'main', '', flat.Node{
+		value: 'Aligned'
+		typ:   flat.source_type_id('aligned=64')
+	})
+	aligned_type := types.Type(types.Struct{
+		name_id: flat.source_type_id('Aligned')
+	})
+	pointer_copy := g.heap_local_memdup_expr('p', aligned_type, 'Aligned', true)
+	pointer_expected := '(Aligned*)v3_aligned_memdup(p, sizeof(Aligned), 64)'
+	assert pointer_copy == pointer_expected
+	value_copy := g.heap_local_memdup_expr('x', aligned_type, 'Aligned', false)
+	value_expected := '(Aligned*)v3_aligned_memdup(&x, sizeof(Aligned), 64)'
+	assert value_copy == value_expected
+	plain_type := types.Type(types.Struct{
+		name_id: flat.source_type_id('Plain')
+	})
+	assert g.heap_local_memdup_expr('p', plain_type, 'Plain', true) == '(Plain*)memdup(p, sizeof(Plain))'
+	tc.structs[flat.source_type_id('Holder')] = [types.StructField{
+		name: 'values'
+		typ:  types.Type(types.ArrayFixed{ elem_type: aligned_type, len: 2 })
+	}]
+	holder_type := types.Type(types.Struct{ name_id: flat.source_type_id('Holder') })
+	assert g.heap_local_memdup_expr('h', holder_type, 'Holder', false) == '(Holder*)v3_aligned_memdup(&h, sizeof(Holder), __alignof__(Holder))'
+	assert g.pointer_free_needs_aligned_free(types.Type(types.Pointer{ base_type: holder_type }))
+	assert !g.pointer_free_needs_aligned_free(types.Type(types.Pointer{ base_type: plain_type }))
+}
+
+fn test_heap_local_address_expr_copies_pointer_local_slot() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	int_ptr := types.Type(types.Pointer{
+		base_type: &types.Type(types.int_)
+	})
+	int_ptr_ptr := types.Type(types.Pointer{
+		base_type: &types.Type(int_ptr)
+	})
+	tc.push_scope()
+	tc.cur_scope.insert_with_owner('p', int_ptr)
+	p_id := stmt_test_node(mut a, .ident, 'p', [])
+	amp_p_id := stmt_test_prefix(mut a, .amp, p_id)
+	heap_expr := g.heap_local_address_expr(amp_p_id, int_ptr_ptr) or {
+		assert false, 'expected the address of a pointer local to escape through a heap copy'
+		return
+	}
+	assert heap_expr == '(i64**)memdup(&p, sizeof(i64*))'
+	tc.pop_scope()
+}
+
+fn test_heap_local_address_expr_copies_selector_from_stack_alias() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	int_type := types.Type(types.int_)
+	struct_type := types.Type(types.Struct{
+		name_id: flat.source_type_id('S')
+	})
+	struct_ptr := types.Type(types.Pointer{
+		base_type: &types.Type(struct_type)
+	})
+	int_ptr := types.Type(types.Pointer{
+		base_type: &types.Type(int_type)
+	})
+	tc.structs[flat.source_type_id('S')] = [types.StructField{
+		name: 'x'
+		typ:  int_type
+	}]
+	tc.push_scope()
+	tc.cur_scope.insert_with_owner('s', struct_type)
+	p_owner := tc.cur_scope.insert_with_owner('p', struct_ptr)
+	g.declare_local_pointer_alias_source(p_owner, 's')
+	p_id := stmt_test_node(mut a, .ident, 'p', [])
+	selector_id := stmt_test_node(mut a, .selector, 'x', [p_id])
+	amp_selector_id := stmt_test_prefix(mut a, .amp, selector_id)
+	heap_expr := g.heap_local_address_expr(amp_selector_id, int_ptr) or {
+		assert false, 'expected a selected field in stack-aliased storage to escape through a heap copy'
+		return
+	}
+	assert heap_expr == '(i64*)memdup(&p->x, sizeof(i64))'
+	g.declare_local_pointer_alias_source_kind(p_owner, 'arg', true)
+	mut_param_expr := g.heap_local_address_expr(amp_selector_id, int_ptr) or {
+		assert false, 'expected a selected field backed by a mut parameter to keep its address'
+		return
+	}
+	assert mut_param_expr == '&p->x'
+	g.declare_local_pointer_alias_source(p_owner, '')
+	external_expr := g.heap_local_address_expr(amp_selector_id, int_ptr) or {
+		assert false, 'expected a selected field in non-stack storage to keep its address'
+		return
+	}
+	assert external_expr == '&p->x'
+	tc.pop_scope()
+}
+
+fn test_inline_asm_x86_reverses_every_structured_operand() {
+	aliases := {
+		'dst': true
+		'src': true
+	}
+	assert lower_c_inline_asm_template('imul dst, src, 7', 'amd64', aliases, true) == 'imul \$7, %[src], %[dst]'
+	assert lower_c_inline_asm_template('mov dst, src', 'amd64', aliases, true) == 'mov %[src], %[dst]'
+}
+
+fn test_inline_asm_x86_port_io_uses_32_bit_view_of_wide_operands() {
+	aliases := {
+		'port':  true
+		'value': true
+	}
+	wide := {
+		'value': true
+	}
+	assert lower_c_inline_asm_template_with_wide_aliases('in value, port', 'amd64', aliases,
+		wide, true) == 'in %[port], %k[value]'
+	assert lower_c_inline_asm_template_with_wide_aliases('out port, value', 'amd64', aliases,
+		wide, true) == 'out %k[value], %[port]'
+	assert lower_c_inline_asm_template_with_wide_aliases('mov value, port', 'amd64', aliases,
+		wide, true) == 'mov %[port], %[value]'
+}
+
+fn test_inline_asm_intel_templates_keep_destination_first_order() {
+	aliases := {
+		'value':     true
+		'increment': true
+	}
+	assert lower_c_inline_asm_intel_template('add value, increment', aliases, false) == 'add %V[value], %V[increment]'
+	assert lower_c_inline_asm_intel_template('mov rax, 7', aliases, false) == 'mov rax, 7'
+	assert lower_c_inline_asm_intel_template('mov rax, [value + rcx*4 + 8]', aliases, false) == 'mov rax, [%V[value] + rcx*4 + 8]'
+	assert lower_c_inline_asm_intel_template('mov rax, `A`', aliases, false) == "mov rax, 'A'"
+	assert lower_c_inline_asm_intel_template('loop_start:', aliases, false) == 'loop_start:'
+	assert lower_c_inline_asm_intel_template('vpxord zmm0{k1}{z}, zmm0, zmm0', aliases, true) == 'vpxord zmm0%{k1%}%{z%}, zmm0, zmm0'
+}
+
+fn test_inline_asm_raw_templates_are_taken_verbatim() {
+	source := '"addl %[increment], %[value]\\n\\t"
+"nop%{%%k1%}\\n\\t" // trailing comment
+'
+	assert parse_c_inline_asm_raw_templates(source) == [
+		'addl %[increment], %[value]\\n\\t',
+		'nop%{%%k1%}\\n\\t',
+	]
+}
+
+fn test_inline_asm_block_reads_raw_and_intel_modifiers() {
+	raw := parse_c_inline_asm_block('asm amd64 raw {
+	"nop\\n\\t"
+	; [out] "=r" (result)
+	; [lhs] "r" (lhs)
+	; cc
+}') or {
+		assert false
+		return
+	}
+	assert raw.arch == 'amd64'
+	assert raw.is_raw
+	assert !raw.is_intel
+	assert raw.templates == ['nop\\n\\t']
+	assert raw.output.map(it.constraint) == ['=r']
+	assert raw.output.map(it.alias) == ['out']
+	assert raw.input.map(it.alias) == ['lhs']
+	assert raw.clobbered == ['cc']
+
+	intel := parse_c_inline_asm_block('asm amd64 intel {
+	add value, increment
+	; +r (value)
+}') or {
+		assert false
+		return
+	}
+	assert intel.arch == 'amd64'
+	assert intel.is_intel
+	assert !intel.is_raw
+	assert intel.templates == ['add value, increment']
+}
+
+fn test_inline_asm_header_comments_do_not_enable_modifiers() {
+	block := parse_c_inline_asm_block('asm amd64 /* raw intel */ {
+	mov rax, rbx
+}') or {
+		assert false
+		return
+	}
+	assert block.arch == 'amd64'
+	assert !block.is_raw
+	assert !block.is_intel
+	assert block.templates == ['mov rax, rbx']
+}
+
+fn test_inline_asm_x86_registers_include_avx512_mask_registers() {
+	assert is_c_inline_asm_x86_register('k0')
+	assert is_c_inline_asm_x86_register('k7')
+	assert !is_c_inline_asm_x86_register('k8')
+	assert !is_c_inline_asm_x86_register('kernel')
+	assert is_c_inline_asm_x86_register('tmm0')
+	assert is_c_inline_asm_x86_register('tmm7')
+	assert is_c_inline_asm_x86_register('bnd0')
+	assert is_c_inline_asm_x86_register('bnd3')
+	assert !is_c_inline_asm_x86_register('bnd4')
+	assert is_c_inline_asm_x86_register('cs')
+	assert is_c_inline_asm_x86_register('cr15')
+	assert is_c_inline_asm_x86_register('dr0')
+	assert is_c_inline_asm_x86_register('st')
+	assert is_c_inline_asm_x86_register('r16')
+	assert is_c_inline_asm_x86_register('r31d')
+	assert !is_c_inline_asm_x86_register('r7')
+	assert !is_c_inline_asm_x86_register('r32')
+	assert is_c_inline_asm_x86_register('mm7')
+	assert !is_c_inline_asm_x86_register('mm8')
+	assert !is_c_inline_asm_x86_register('st8')
+	assert !is_c_inline_asm_x86_register('tmm8')
+	assert !is_c_inline_asm_x86_register('xmm32')
+	assert !is_c_inline_asm_x86_register('r999')
+	assert lower_c_inline_asm_template('mov ax, cs', 'amd64', map[string]bool{}, false) == 'mov %cs, %ax'
+}
+
+fn test_unsafe_value_block_scopes_direct_array_access() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	array_type := types.Type(types.Array{ elem_type: &types.Type(types.int_) })
+	values := stmt_test_node(mut a, .ident, 'values', [])
+	index := stmt_test_node(mut a, .int_literal, '1', [])
+	element := stmt_test_node(mut a, .index, '', [values, index])
+	tc.cur_scope.insert('values', array_type)
+	tc.register_synth_type(values, array_type)
+	tc.register_synth_type(element, types.Type(types.int_))
+	expression := stmt_test_node(mut a, .expr_stmt, '', [element])
+	block := stmt_test_node(mut a, .block, 'unsafe', [expression])
+	g.gen_expr(block)
+	unchecked := g.sb.str()
+	assert unchecked.contains('.data'), unchecked
+	assert !unchecked.contains('array_get('), unchecked
+	assert g.unsafe_depth == 0
+	g.sb.clear()
+	g.gen_expr(element)
+	checked := g.sb.str()
+	assert checked.contains('array_get('), checked
+}
+
+fn test_lowered_ident_annotation_precedes_outer_checker_binding() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	tc.cur_scope.insert('err', types.Type(types.String{}))
+	value := a.add_node(flat.Node{
+		kind:  .ident
+		value: 'err'
+		typ:   flat.source_type_int
+	})
+	assert types.semantic_types_equal(g.usable_expr_type(value), types.Type(types.int_))
+}
+
+fn test_expression_type_references_survive_memo_generations() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	g.memo_usable_expr_types = true
+	value := a.add_node(flat.Node{ kind: .ident, value: 'value', typ: flat.source_type_id('int') })
+	g.begin_usable_expr_type_memo()
+	first := g.usable_expr_type(value)
+	assert voidptr(first) == voidptr(tc.parse_type(flat.source_type_id('int')))
+	assert voidptr(first) == voidptr(g.usable_expr_type(value))
+	g.end_usable_expr_type_memo()
+	a.nodes[int(value)].typ = flat.source_type_id('string')
+	g.begin_usable_expr_type_memo()
+	second := g.usable_expr_type(value)
+	assert second.name() == 'string'
+	assert first.name() == 'int'
+	assert voidptr(second) == voidptr(tc.parse_type(flat.source_type_id('string')))
+	g.end_usable_expr_type_memo()
+}
+
+fn test_staging_declarations_do_not_evaluate_default_initializers() {
+	mut a := flat.FlatAst.new()
+	mut tc := types.TypeChecker.new(&a)
+	tc.sum_types.set(flat.source_type_id('Value'), ['int', 'string'])
+	tc.type_aliases.set(flat.source_type_id('Mapping'), 'map[string]int')
+	mut g := FlatGen.new()
+	g.a = &a
+	g.tc = &tc
+	type_names := [
+		'int',
+		'&int',
+		'[]int',
+		'map[string]int',
+		'[2]map[string]int',
+		'fn (int) int',
+		'?int',
+		'!int',
+		'Value',
+		'Mapping',
+	]
+	for i, typ in type_names {
+		lhs := a.add_node(flat.Node{
+			kind:  .ident
+			value: 'staging_${i}'
+			typ:   flat.source_type_id(typ)
+		})
+		rhs := stmt_test_node(mut a, .call, 'unused_default', [])
+		decl := stmt_test_node(mut a, .decl_assign,
+			'__v3_zeroed_stack_value_decl', [lhs, rhs])
+		a.nodes[int(decl)].typ = flat.source_type_id(typ)
+		a.nodes[int(decl)].is_mut = true
+		g.gen_decl_assign(a.nodes[int(decl)])
+		assert g.local_storage_is_mutable('staging_${i}')
+		assert !g.current_decl_is_mut
+	}
+	generated := g.sb.str()
+	for call in ['unused_default', 'new_map(', 'array_new(', 'memdup('] {
+		assert !generated.contains(call), generated
+	}
+	assert generated.count(' = {0};') == type_names.len
+	assert generated.contains('map staging_4[2]')
+}
+
+fn test_qualified_mut_parameter_copy_preserves_value_staging_storage() {
+	for pointer_decl in [false, true] {
+		mut a := flat.FlatAst.new()
+		mut tc := types.TypeChecker.new(&a)
+		tc.structs[flat.source_type_id('snapshot.State')] = []types.StructField{}
+		value_type := types.Type(types.Struct{ name_id: flat.source_type_id('snapshot.State') })
+		pointer_type := types.Type(types.Pointer{ base_type: value_type })
+		mut g := FlatGen.new()
+		g.a = &a
+		g.tc = &tc
+		g.cur_param_types['source'] = types.new_type_reference(pointer_type)
+		g.cur_mut_params['source'] = true
+		g.cur_mut_param_owners['source'] = tc.cur_scope.insert_with_owner('source', pointer_type)
+		decl_type := if pointer_decl { '&snapshot.State' } else { 'snapshot.State' }
+		lhs := a.add_node(flat.Node{
+			kind:  .ident
+			value: 'copied'
+			typ:   flat.source_type_id(decl_type)
+		})
+		rhs := a.add_node(flat.Node{
+			kind:  .ident
+			value: 'source'
+			typ:   flat.source_type_id('&snapshot.State')
+		})
+		tc.register_synth_type(rhs, pointer_type)
+		decl := stmt_test_node(mut a, .decl_assign, '__v3_stack_value_decl', [lhs, rhs])
+		a.nodes[int(decl)].typ = flat.source_type_id(decl_type)
+		g.gen_decl_assign(a.nodes[int(decl)])
+		generated := g.sb.str()
+		assert generated.contains(if pointer_decl {
+			'snapshot__State* copied = source;'
+		} else {
+			'snapshot__State copied = *source;'
+		}), generated
+	}
+}
+
+fn test_tinyc_declarations_preserve_explicit_stack_alignment() {
+	for decl_kind in ['', '__v3_zeroed_stack_value_decl'] {
+		mut a := flat.FlatAst.new()
+		node := flat.Node{ kind: .struct_decl, value: 'Aligned', typ: flat.source_type_id('aligned=64') }
+		decl := a.add_node(node)
+		mut tc := types.TypeChecker.new(&a)
+		tc.structs[flat.source_type_id('Aligned')] = []types.StructField{}
+		tc.type_declaration_ids[flat.source_type_id('Aligned')] = [int(decl)]
+		tc.declaration_attributes[int(decl)] = ['aligned: 64']
+		mut g := FlatGen.new()
+		g.a = &a
+		g.tc = &tc
+		g.set_ccompiler('tcc')
+		g.register_struct_decl_info_at(int(decl), node.value, node.value,
+			'main', 'aligned.v', 'aligned.v', node)
+		for name in ['alloca', 'v_alloca', '__v3_internal_symbol_libc_alloca'] {
+			local := stmt_test_node(mut a, .ident, name, [])
+			value := stmt_test_node(mut a, .int_literal, '7', [])
+			assignment := stmt_test_node(mut a, .decl_assign, '', [local, value])
+			a.nodes[int(assignment)].typ = flat.source_type_id('int')
+			g.gen_decl_assign(a.nodes[int(assignment)])
+		}
+		lhs := stmt_test_node(mut a, .ident, 'staging', [])
+		rhs := stmt_test_node(mut a, .struct_init, 'Aligned', [])
+		staging := stmt_test_node(mut a, .decl_assign, decl_kind, [lhs, rhs])
+		a.nodes[int(staging)].typ = flat.source_type_id('Aligned')
+		g.gen_decl_assign(a.nodes[int(staging)])
+		generated := g.sb.str()
+		assert generated.contains('= alloca(sizeof(Aligned)'), generated
+		assert !generated.contains('__builtin_alloca'), generated
+		assert generated.contains(' __v3_internal_symbol_libc_alloca = 7;'), generated
+		assert generated.contains(' v_alloca = 7;'), generated
+		assert generated.contains(' __v3_internal_symbol_source___v3_internal_symbol_libc_alloca = 7;'), generated
+		assert !generated.contains(' alloca ='), generated
+		assert generated.contains('(size_t)(64)')
+		assert generated.contains('Aligned* staging')
+		if decl_kind == '__v3_zeroed_stack_value_decl' {
+			assert generated.contains('memset(staging, 0, sizeof(Aligned))')
+		}
+		assert !generated.contains('memdup')
+		assert g.local_storage_c_type('staging') or { '' } == 'Aligned*'
+	}
+}
+
+fn test_ownership_drop_expansion_keys_keep_kind_and_spelling_order() {
+	late_id := flat.source_type_id('pkg.ZOwnershipKey')
+	early_id := flat.source_type_id('pkg.AOwnershipKey')
+	struct_key := ownership_drop_expansion_key(types.Type(types.Struct{ name_id: early_id }))
+	interface_key := ownership_drop_expansion_key(types.Type(types.Interface{ name_id: early_id }))
+	sum_key := ownership_drop_expansion_key(types.Type(types.SumType{ name_id: early_id }))
+	assert struct_key != interface_key && struct_key != sum_key && interface_key != sum_key
+	assert ownership_drop_expansion_key(types.Type(types.int_)) == 0
+	mut keys := [sum_key, ownership_drop_expansion_key(types.Type(types.Struct{ name_id: late_id })),
+		struct_key, interface_key]
+	keys.sort_with_compare(compare_ownership_drop_expansion_keys)
+	assert keys[0] == interface_key
+	assert keys[1] == struct_key
+	assert keys[3] == sum_key
+}
+
+fn test_exiting_if_branch_has_no_cleanup_after_transfer() {
+	for kind in [flat.NodeKind.continue_stmt, .break_stmt] {
+		mut a := flat.FlatAst.new()
+		condition := stmt_test_node(mut a, .bool_literal, 'true', [])
+		marker := stmt_test_node(mut a, .int_literal, '12345', [])
+		statement := stmt_test_node(mut a, .expr_stmt, '', [marker])
+		cleanup := stmt_test_node(mut a, .block, '', [statement])
+		deferred := stmt_test_node(mut a, .defer_stmt, '', [cleanup])
+		exit := stmt_test_node(mut a, kind, '', [])
+		body := stmt_test_node(mut a, .block, '', [deferred, exit])
+		branch := stmt_test_node(mut a, .if_expr, '', [condition, body, body])
+		mut tc := types.TypeChecker.new(&a)
+		mut g := FlatGen.new()
+		g.a = &a
+		g.tc = &tc
+		g.loop_defer_starts << 0
+		g.gen_if(a.node(branch))
+		output := g.sb.str()
+		assert output.count('12345;') == 2, output
+		assert g.ownership_scope_index == 2
+		for part in output.split(if kind == .continue_stmt { 'continue;' } else { 'break;' })[1..] {
+			assert part.trim_space().starts_with('}'), output
+		}
+	}
+}

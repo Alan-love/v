@@ -1,0 +1,479 @@
+# net.http
+
+`net.http` is V's HTTP client and server. The client speaks HTTP/1.1 and
+HTTP/2, with HTTP/3 available behind `-d http3`; the server speaks HTTP/1.1 and,
+opt-in, HTTP/2 — over plain TCP or with TLS termination.
+
+For building web applications on top of it, see [`veb`](../../veb), which has its
+own server and router.
+
+## Response and handler helpers
+
+`http.redirect(url, code)` returns an empty redirect response with a `Location` header.
+`http.not_found()` returns a 404 response with the body `404 page not found`.
+`http.error_response(message, code)` returns the message verbatim as plain text, with
+`X-Content-Type-Options: nosniff`. Both error helpers set a UTF-8 content type.
+
+All three helpers return HTTP/1.1 responses with a byte-counted `Content-Length`, including
+zero for an empty body. Numeric status codes are retained even when no standard reason
+phrase exists. Use `Response.set_version` when another protocol version is needed.
+
+```v
+import net.http
+
+redirect := http.redirect('/login', 303)
+assert redirect.status_code == 303
+failure := http.error_response('Access denied', 403)
+assert failure.body == 'Access denied'
+```
+
+`http.strip_prefix(prefix, handler)` wraps an `http.Handler`. It removes a literal prefix
+from the URL path before calling the wrapped handler, and returns 404 for a nonmatching or
+malformed URL. Query strings and escaped path suffixes are preserved. The decoded path and
+any preserved alternative escaped spelling must both match the prefix, so `/api` does not
+match `/%61pi`.
+
+An empty prefix passes the request through unchanged. Removing the entire path leaves `/`.
+Matching uses a string prefix: use `/api/` when a directory boundary is required. The wrapper
+supports mutable handlers and leaves the caller's request unchanged.
+
+## Status reason phrases
+
+`http.status_from_int(code).str()` returns the standard HTTP reason phrase, matching
+[Go's StatusText](https://go.dev/src/net/http/status.go). Unknown and unassigned codes return
+an empty string, including legacy nonstandard statuses 306 and 509. Servers retain the numeric
+status code when the reason phrase is empty, and an explicit custom reason phrase is preserved.
+
+The existing enum identifiers `checkpoint_draft` and `unordered_collection` remain available
+for compatibility. Their standard phrases are `Early Hints` (103) and `Too Early` (425).
+Status 203 uses `Non-Authoritative Information`, 207 uses `Multi-Status`, and 418 uses
+`I'm a teapot`.
+
+A server without an explicit `listener` opens a socket on its configured `addr`, even when
+standard input is a socket. An explicitly supplied listener may use descriptor zero. Closing
+the server clears the closed listener, so a later `listen_and_serve()` binds a new socket on
+the server's address. Failed accepts other than timeouts pause briefly before retrying.
+
+## Making requests
+
+```v ignore
+import net.http
+
+resp := http.get('https://example.com/')!
+println(resp.status_code)
+println(resp.body)
+```
+
+`http.get` checks the server certificate, and `http.fetch(..., validate: false)` skips that check.
+`get`, `post`, and the other helpers check the certificate.
+`fetch`, `prepare`, and `download_file_with_progress` accept `validate: false`.
+Leave `verify` empty to use the system trust store on HTTP/1.1 and HTTP/2.
+HTTP/3 ignores `validate: false` and has no system trust store, so set `verify`.
+
+`http.post`, `http.post_json`, `http.post_form`, `http.put`, `http.patch`,
+`http.head` and `http.delete` cover the common verbs. `http.fetch` takes a
+`FetchConfig` when you need headers, cookies, timeouts, redirect control,
+client certificates or progress callbacks:
+
+```v ignore
+import net.http
+
+resp := http.fetch(
+	url:    'https://example.com/api'
+	method: .post
+	header: http.new_header(key: .content_type, value: 'application/json')
+	data:   '{"hello":"world"}'
+)!
+```
+
+HTTPS requests use HTTP/1.1 by default. Set `enable_http2: true` in
+`http.fetch` or a `http.Request` to opt in to HTTP/2 when the server supports it.
+
+Cookies given in `cookies` of `http.fetch`, or added with `Request.add_cookie`, are sent in
+one `Cookie` header as `name=value` pairs. A value goes through `sanitize_cookie_value`. A
+cookie whose name is empty or contains `;`, `=`, a space, a control character or a non-ASCII
+byte is not sent. `Request.cookie_header_value` returns the header value that is sent.
+
+A positive `stop_copying_limit` caps the stored HTTP/1.1 or HTTP/2 response body in bytes,
+independently of response headers and network read boundaries. HTTP/1.1 preserves the full body
+for nonpositive limits. Chunked HTTP/1.1 responses count body bytes after removing chunk framing.
+HTTP/1.1 still applies `Content-Encoding` decompression, and caps the resulting body at the limit.
+If the bounded compressed prefix cannot be decompressed, it retains the encoded prefix, as with
+ordinary response parsing. The client still reads the full response and invokes progress callbacks,
+so streaming downloads can keep a bounded preview without losing data in the callbacks.
+
+Decoded response bodies are limited to 16 MiB total across `Content-Encoding` layers by default.
+Set `FetchConfig.max_total_decompressed_bytes` to a larger positive value for larger bodies; a
+nonpositive value disables the cumulative limit. Each decoded stage still has a representational
+ceiling. Gzip and deflate stages are capped at `max_int - 32768` with 32-bit `int`, or `2^62 - 1`
+with `-d new_int -x64`; Brotli stages are capped at `max_int - 1` or `2^62`, respectively.
+Exceeding either ceiling returns `ResponseDecompressionLimitError`. This bounds decoded output, not
+total process memory; transport buffers and decoder history also use memory. Responses may contain
+at most eight content-encoding layers.
+A positive `stop_copying_limit` smaller than the remaining decoded-byte budget caps the stored
+decoded body and stops decoding once that preview is full. Any remaining compressed data and its
+checksum are not validated. If the preview limit is at or above the remaining decoded-byte budget,
+exceeding the hard budget returns `ResponseDecompressionLimitError`. A received encoded prefix
+known to be incomplete is kept as-is rather than decoded.
+
+With HTTP/2 negotiation disabled, returning an error from `on_progress` or `on_progress_body`
+stops an HTTP/1.1 request without retrying or replaying it, including on a reused connection.
+The caller receives the original callback error with its type and code preserved. This also
+applies when connection reuse is disabled. The Windows Schannel backend with connection reuse
+disabled supports `on_progress`; it does not invoke `on_progress_body`.
+
+An HTTP/2 or HTTP/3 response with a field that can not be delivered is an error, not a
+response without that field: a field name that is not a token, or a field value with CR, LF
+or NUL, makes the response malformed, and more than `http.max_headers` fields, trailers
+included, is an `http.HeaderLimitError`.
+
+## Serving requests
+
+A server is a `Handler` — anything with a `handle(Request) Response` method —
+plus an `http.Server` to run it:
+
+```v ignore
+import net.http
+
+struct App {}
+
+fn (mut a App) handle(req http.Request) http.Response {
+	return http.Response{
+		status_code: 200
+		body:        'you asked for ${req.url}'
+	}
+}
+
+fn main() {
+	mut server := &http.Server{
+		addr:    ':8080'
+		handler: App{}
+	}
+	server.listen_and_serve()
+}
+```
+
+Set `cert` and `cert_key` to terminate TLS (PEM strings when
+`in_memory_verification` is true, otherwise file paths). Set `enable_http2` to
+serve HTTP/2: on the TLS listener it advertises ALPN `h2, http/1.1`, and on the
+plain listener it accepts prior-knowledge cleartext h2c. Either way a client
+that does not ask for HTTP/2 keeps the ordinary HTTP/1.1 path.
+
+An HTTP/2 request with a field name that is not a token, or a field value with CR, LF or
+NUL, is malformed: its stream is reset and the handler is not called. A request with more
+than `http.max_headers` fields, counting the `Host` field that `:authority` becomes, is
+answered with `431 Request Header Fields Too Large`.
+
+HTTP/1 request lines and headers are limited to 64 KiB in total; oversized heads receive
+`431 Request Header Fields Too Large` and the connection is closed. `Server.read_header_timeout`
+sets the total time allowed to receive that head (30 seconds by default); set it to `0` to
+disable the deadline. `Server.read_timeout` continues to control individual reads and request
+bodies.
+
+HTTP/1.1 `Content-Length` bodies are limited to 8 MiB by default before the server allocates
+their storage. Set `Server.max_http1_request_body_size` to another positive byte count to
+change the limit, or to `0` for no limit. A request above the limit receives `413 Request
+Entity Too Large` and the connection is closed. This setting applies to plain and TLS
+HTTP/1.1; HTTP/2 keeps its separate 8 MiB server limit. `parse_request` uses the same safe
+8 MiB default when called directly. Use `parse_request_with_body_limit` when a parser caller
+needs to set a different limit. Use an unlimited setting only when all clients are trusted.
+Negative limits are rejected. Invalid, overflowing, or conflicting `Content-Length` fields,
+and unsupported `Transfer-Encoding` fields, receive `400 Bad Request` and close the
+connection. Chunked request bodies are not supported by this parser.
+
+## Identifying the client
+
+`Request.remote_addr` is the address of the peer that sent the request — the
+equivalent of Go's `http.Request.RemoteAddr`. `Request.remote_ip()` returns the
+same thing without the port:
+
+```v ignore
+import net.http
+
+struct App {}
+
+fn (mut a App) handle(req http.Request) http.Response {
+	return http.Response{
+		status_code: 200
+		body:        'you are ${req.remote_ip()} (${req.remote_addr})'
+	}
+}
+```
+
+| request | `remote_addr` | `remote_ip()` |
+| --- | --- | --- |
+| IPv4 peer | `127.0.0.1:52134` | `127.0.0.1` |
+| IPv6 peer | `[::1]:52134` | `::1` |
+| link-local IPv6 peer | `[fe80::1%3]:52134` | `fe80::1%3` |
+| built by you, to send | `''` | `''` |
+
+Three things are worth knowing about it:
+
+**It is server-side only.** `http.Server` fills it in for every request it hands
+to a `Handler`, on all of its paths — plain HTTP/1.1, TLS HTTP/1.1, h2c and
+HTTP/2 over TLS. A `Request` you construct yourself to send with the client has
+an empty `remote_addr`, and so does a request served by `veb`, which has its own
+server: use `ctx.ip()` there.
+
+**It cannot be forged.** The address is read from the accepted socket, not from
+anything the client sent. The server also mirrors the bare IP into a
+`Remote-Addr` request header, which predates this field; any `Remote-Addr`
+header the client sent is discarded first, in any casing, so it cannot shadow
+the real one. That header is best-effort — headers live in a fixed-size array,
+so a request that already filled it leaves no room — while `remote_addr` is
+always set. Prefer the field.
+
+**A scoped IPv6 address keeps its zone.** A link-local peer is reported as
+`[fe80::1%3]:52134`, where `3` is the numeric interface index: a link-local
+address only identifies a host together with the interface it was seen on, and
+without the zone the address cannot be dialled back. `net.split_address` and
+`net.dial_tcp` both accept that form.
+
+### Behind a reverse proxy
+
+If your server sits behind nginx, a load balancer or a CDN, then the proxy is
+the peer: `remote_addr` is the proxy's address, which is correct but probably
+not what you want to log or rate-limit on.
+
+The original client address is only available in a header the proxy adds —
+`X-Forwarded-For`, `X-Real-Ip`, `CF-Connecting-IP` and friends. **Those are
+request headers like any other: a client that can reach your server directly
+can send whatever it likes in them.** They are trustworthy only if nothing but
+your proxy can open a connection to the server, and only after you have
+configured the proxy to overwrite (not append to) them.
+
+So use `remote_addr` to decide whether the connection came from your proxy, and
+only then read the forwarded header:
+
+```v ignore
+import net.http
+
+const trusted_proxy = '10.0.0.1'
+
+fn client_ip(req http.Request) string {
+	if req.remote_ip() != trusted_proxy {
+		return req.remote_ip()
+	}
+	// X-Forwarded-For is a list, oldest first; the last entry is the one our
+	// own proxy appended, and the only one it vouches for.
+	forwarded := req.header.get(.x_forwarded_for) or { return req.remote_ip() }
+	return forwarded.all_after_last(',').trim_space()
+}
+```
+
+## Server-sent event encoding
+
+`http.SSEEvent` formats server-sent events independently of a connection. Set its `id`,
+`event`, `data` and `retry` fields, then call `encode()` for a string or
+`encode_into(mut builder)` to append to a `strings.Builder`. Each event ends with a blank
+line. Data normalizes CRLF and CR line endings to LF and emits a `data:` field per line;
+CR and LF are removed from `id` and `event`. Empty fields and zero `retry` are omitted,
+so an empty event encodes as a single LF and does not dispatch a browser message.
+
+## Content type detection
+
+`http.detect_content_type(bytes)` recognizes common image, audio, video, document and archive
+signatures. It examines at most 512 bytes, plus up to three bytes to finish a UTF-8 sequence
+crossing that boundary. Text without a recognized document signature returns
+`text/plain; charset=utf-8`; other unknown content returns `application/octet-stream`.
+Use sniffing only when no explicit content type is available. In particular, serving sniffed
+HTML from your application origin permits that content to run scripts.
+
+## Cookie jars
+
+`http.new_cookie_jar()` creates an in-memory cookie jar. Store response cookies with
+`jar.set_cookies(response_url, response.cookies())`, using the URL that produced the response.
+Use `jar.cookies_header(request_url)` as the next request's `Cookie` header, or
+`jar.cookies(request_url)` to retrieve the matching `Cookie` values.
+
+```v
+import net.http
+
+mut jar := http.new_cookie_jar()
+jar.set_cookies('https://example.com/account/login', [
+	http.Cookie{
+		name:  'sid'
+		value: 'abc'
+	},
+])
+assert jar.cookies_header('https://example.com/account/profile') == 'sid=abc'
+assert jar.cookies_header('https://sub.example.com/account/profile') == ''
+```
+
+URLs must be absolute HTTP or HTTPS URLs with a host; other URLs are ignored. Cookies without
+`Domain` stay on the response host. An explicit domain must be valid and match that host; IP
+addresses require an exact match. Domains are compared without case distinctions or a leading
+dot, and equivalent name/domain/path entries replace or delete each other. The jar does not
+check a public suffix list.
+
+Path matching uses the escaped URL path. Missing, empty, or relative `Path` attributes use
+the response URL's directory. `Max-Age` takes precedence over `Expires`, expired cookies are
+excluded, and `Secure` cookies are returned only for HTTPS. Header generation validates names
+and sanitizes and quotes values using the same rules as `Request.cookie_header_value()`.
+
+## Cookies, headers and multipart
+
+Header value validation also works in `-check-overflow` builds: permitted TAB bytes are kept.
+
+`Request.add_cookie`/`Request.cookie` and `Response.cookies` handle cookies.
+`Response.cookies` reads `Max-Age` as a decimal integer: a positive number of seconds is
+stored in `Cookie.max_age`, zero or a negative number as `-1` (delete now). Any other value
+remains in `Cookie.unparsed`, which holds only the attributes that were not read.
+`Response.cookies` parses `Expires` with `time.parse_http_header_string`. Invalid dates
+and years before 1601 remain in `Cookie.unparsed`; they do not replace a valid expiry.
+`Cookie.raw_expires` retains date text even when it cannot be parsed.
+`Cookie.str()` writes the attribute names `Path`, `Domain` and `Expires` as RFC 6265
+spells them; `Response.cookies` matches attribute names in any case.
+When serializing `Cookie`, IPv4 literals such as `127.0.0.1` are accepted as domains;
+invalid domains are omitted.
+`Cookie.str()` omits `SameSite` for `.same_site_not_set` and `.same_site_default_mode`.
+The explicit modes write `SameSite=Lax`, `SameSite=Strict` or `SameSite=None`.
+
+`Cookie.str()` writes a cookie only when its name is an RFC 9110 token: letters, digits
+and ``!#$%&'*+-.^_`|~``. For any other name, such as one with a space, `;`, `,`, `=` or
+`[`, it returns an empty string. Reading is more lenient: `Request.cookie`,
+`Response.cookies` and `read_cookies` return any name made of visible ASCII characters.
+
+`Header` provides both `CommonHeader` enum access (`get`, `set`, `add`) and
+string access (`get_custom`, `set_custom`, `add_custom`). `http.parse_form`,
+`http.parse_multipart_form` and `http.post_multipart_form` cover form bodies.
+`http.parse_form` decodes URL-encoded fields only; it does not detect or decode JSON.
+Select a JSON decoder by the request's content type when handling JSON bodies directly.
+[`veb`](../../veb) makes JSON object fields available in its `ctx.form` map.
+
+Uploaded file names are untrusted input. `http.safe_filename(name)` returns the last path
+component, treating both `/` and `\` as separators, and returns an error for an empty
+component, `.`, `..`, or a component containing NUL. Check the returned name against your
+destination directory and platform's file naming rules before writing the upload.
+
+A `Header` holds at most `http.max_headers` (50) fields. `add_custom` and `set_custom`
+return an `http.HeaderLimitError` for a field that does not fit, and so do
+`http.parse_request`, `http.parse_response` and the other parsers for a message that has
+more header fields. `add`, `set`, `new_header` and `join` have no error to return: they
+drop such a field.
+
+A field value can not contain CR, LF or NUL (RFC 9110 section 5.5): written as they are,
+these bytes end the field line. `add_custom` and `set_custom` return an
+`http.HeaderValueError` for such a value, and so do the parsers for a received field
+whose value has a bare CR or a NUL. `add`, `set`, `new_header` and `join` store a space
+in place of each of these bytes. `Request.do` and `http.fetch` return the error for a
+`user_agent` that contains one of them.
+
+The spaces and tabs at the start and end of a field value are optional whitespace, not part
+of the value (RFC 9110 section 5.5). `Header.render` and the HTTP/1 response writers remove
+this edge whitespace. The HTTP/1 request writer also trims values in `Request.header` other
+than `Cookie`: `add_custom('X-Pad', '  padded  ')` is sent as `X-Pad: padded`, as Go's
+`Header.Write` does. The `Request.user_agent` fallback and explicit `Cookie` header values
+are not trimmed. This trimming guarantee does not apply to the HTTP/2 and HTTP/3 writers.
+`get` and `values` still return the value as it was stored.
+
+`Cookie.str()` and `sanitize_cookie_value` remove invalid bytes from cookie values,
+including control characters, quotes, semicolons and backslashes. Spaces and commas
+are preserved; the sanitized value is quoted when it contains a space or comma.
+
+`Header.render(canonicalize: true)` writes each field name in a canonical spelling instead of
+the stored one. A name that has a `CommonHeader` is spelled like `CommonHeader.str()`, the
+spelling of the IANA HTTP Field Name Registry for the names registered there: `ETag`, `TE`,
+`WWW-Authenticate`. Any other name gets its first letter and each letter after a `-` in upper
+case and the rest in lower case: `x-request-id` becomes `X-Request-Id`. Go's
+`textproto.CanonicalMIMEHeaderKey` applies the second rule to every name, so it has `Etag`,
+`Te` and `Www-Authenticate` instead; field names are case-insensitive (RFC 9110, section 5.1),
+so both spellings name the same field.
+
+`add_custom` and `set_custom` return an error for a name that is not a valid HTTP field
+name: an empty one, or one with a space, a colon, a control character or any other byte
+that is not an RFC 9110 token character. The name is checked when it is added, because it
+is not checked again when the header is sent.
+
+`http.canonical_header_key(name)` returns the canonical spelling of a header name in any
+case, for example `Accept-Encoding` for `accept-ENCODING`. It never fails: like Go's
+`http.CanonicalHeaderKey`, it returns a name that is not valid unchanged.
+
+### Idle connection reuse
+
+Before reusing an idle plain TCP connection, the client checks for a server-side close.
+A closed connection is discarded before sending request bytes, so a POST can use a fresh
+connection safely. Healthy idle connections remain reusable.
+
+Pooled connections expire after `Transport.idle_timeout` without requiring another request.
+A background worker checks idle pools at least once per second and stops when the pools are empty.
+Active HTTP/2 and HTTP/3 streams are preserved. `close_idle_connections()` can flush pools sooner.
+
+After HTTP/2 GOAWAY, new requests use a fresh connection. The replaced connection stops accepting
+new streams, lets active streams finish, and stops its reader when idle.
+
+If a non-idempotent request fails after transmission starts, the client returns an error
+without replaying it: a missing response does not prove that the server ignored the request.
+
+### Windows TLS handshake compatibility
+
+On Windows, HTTPS uses Schannel first. If its handshake returns `SEC_E_INVALID_TOKEN`
+(`0x80090308`), the client retries the connection using the configured `net.ssl` backend
+(mbedTLS by default). This happens before sending any HTTP request bytes and also applies
+to pooled connections. Other Schannel errors, including certificate failures, propagate.
+Errors after sending a request do not trigger this backend fallback.
+
+The retry preserves certificate validation, configured certificates, HTTP/2 negotiation,
+request headers, method, and body. `-d no_vschannel` continues to select `net.ssl` directly.
+
+Redirect responses without a `Location` header, or with an empty `Location`, are returned
+to the caller without following another URL.
+
+## Reverse Proxy
+
+`http.new_single_host_reverse_proxy` creates an HTTP reverse proxy that routes incoming
+requests to a target upstream server. It satisfies the `http.Handler` interface:
+
+```v ignore
+import net.http
+
+fn main() {
+	mut rp := http.new_single_host_reverse_proxy('http://127.0.0.1:8080')!
+	mut server := &http.Server{
+		addr:    ':9000'
+		handler: rp
+	}
+	server.listen_and_serve()
+}
+```
+
+The reverse proxy strips hop-by-hop headers (such as `Connection`, `Keep-Alive`,
+`Transfer-Encoding`), manages forwarding headers (`X-Forwarded-For`, `X-Forwarded-Host`,
+`X-Forwarded-Proto`), and supports `director`, `modify_response`, and `error_handler` hooks.
+
+Paths retain percent-encoded separators when joined to the upstream base path. Forwarding
+metadata describes the incoming host and URL scheme, while `preserve_host` controls the
+upstream `Host` header. Relative incoming URLs default to `http`; a TLS terminator should
+set `X-Forwarded-Proto` to `https` in its `director` hook. Existing forwarding headers are
+preserved, so clear or replace values from untrusted clients in that hook before using them
+for authentication or access control. HTTPS upstream certificate validation is enabled.
+
+Requests and responses are buffered by the HTTP client. WebSocket upgrades and other
+protocol tunnels are not supported. A director or response modifier may replace the body;
+its content length is recalculated when its size changes. Response modifiers receive the
+upstream representation, including any content encoding. A hook that changes the representation
+must also update or remove `Content-Encoding`. Response hop headers are removed before the hook;
+the hook is responsible for any headers it adds.
+
+## Diagnostic request and response dumps
+
+`http.dump_request(req, body)` renders the stored method, URL, version and headers as
+HTTP/1-style text. An empty URL is shown as `/`. The URL is otherwise preserved as stored,
+and headers normally added by the transport are not synthesized. Header rendering follows
+the selected version, but HTTP/2 and HTTP/3 dumps are text, not wire frames.
+
+`http.dump_response(resp, body)` uses the same representation as `resp.bytestr()`.
+For both helpers, setting `body` to `true` includes the stored body byte for byte; `false` omits it
+without changing the status line or headers such as `Content-Length`. Neither helper
+modifies its input.
+
+```v
+import net.http
+
+req := http.Request{
+	method: .post
+	url:    '/upload'
+	data:   'hello'
+}
+assert http.dump_request(req, true) == 'POST /upload HTTP/1.1\r\n\r\nhello'
+```

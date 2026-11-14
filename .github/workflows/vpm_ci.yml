@@ -1,0 +1,74 @@
+name: VPM CI
+
+on:
+  workflow_call:
+
+concurrency:
+  group: vpm-vpm_ci-${{ github.ref == 'refs/heads/master' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  setup-vpm:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          path: vlang
+      - name: Show git version
+        run: git version
+      - name: Build V
+        uses: ./vlang/.github/actions/setup-v
+        with:
+          working-directory: vlang
+          symlink: false
+          doctor: true
+      - name: Cache V
+        uses: actions/cache/save@v6
+        with:
+          path: vlang
+          key: ${{ runner.os }}-${{ github.sha }}
+
+  test-vpm:
+    needs: setup-vpm
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: tcc
+          - os: ubuntu-latest
+            cc: gcc
+          - os: ubuntu-latest
+            cc: clang
+          - os: macos-latest
+            cc: clang
+          - os: windows-latest
+            cc: tcc
+          - os: windows-latest
+            cc: gcc
+          - os: windows-latest
+            cc: msvc
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Restore V cache
+        uses: actions/cache/restore@v6
+        with:
+          path: vlang
+          key: ${{ runner.os }}-${{ github.sha }}
+      - name: Show git version
+        run: git version
+      - name: Build and test VPM
+        run: |
+          cd vlang
+          ./v -W -N cmd/tools/vpm
+          ./v -cc ${{ matrix.cc }} -d network test cmd/tools/vpm

@@ -1,0 +1,19 @@
+struct Button {
+	value int
+}
+
+struct Label {
+	value string
+}
+
+type Control = Button | Label
+
+fn read_value(control &Control) int {
+	button := unsafe { &Button(control) }
+	return button.value
+}
+
+fn main() {
+	control := Control(Button{ value: 7 })
+	assert read_value(&control) == 7
+}

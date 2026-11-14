@@ -1,0 +1,113 @@
+name: CI OpenBSD
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: openbsd-openbsd_ci-${{ github.ref == 'refs/heads/master' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+### See https://github.com/cross-platform-actions/action
+### for a description of the used fields here
+
+permissions:
+  contents: read
+
+jobs:
+  tcc-openbsd:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Start OpenBSD VM for tcc
+        id: vm-openbsd-tcc
+        uses: cross-platform-actions/action@82668f1fbd89d9c99487604f822cbf6716f124d3 # v1.7.0
+        with:
+          operating_system: openbsd
+          version: '7.8'
+          memory: 8G
+          cpu_count: 2
+          sync_files: runner-to-vm
+
+      - name: Tests on OpenBSD with tcc
+        id: tests-openbsd-tcc
+        shell: cpa.sh {0}
+        run: |
+          set -eu
+          sudo pkg_add git sqlite3 gmake boehm-gc libiconv openssl
+          # Install packages needed to build examples
+          sudo pkg_add mariadb-client postgresql-client
+          # Mandatory: hostname not set in VM => some tests fail
+          sudo hostname -s openbsd-ci
+          echo "::group::OS infos"
+          uname -a
+          echo "::endgroup::"
+          echo "::group::Build V"
+          git config --global --add safe.directory .
+          # Cold V3 builds of the fast tool reserve more than 4 GiB of data.
+          # Give compiler arenas 6 GiB within this 8 GiB VM.
+          ulimit -d 6291456
+          gmake
+          env VFLAGS= ./v -prod -cc cc -parallel-cc self
+          sudo ./v symlink
+          export VTEST_SHOW_LONGEST_BY_RUNTIME=3
+          export VTEST_SHOW_LONGEST_BY_COMPTIME=3
+          export VTEST_SHOW_LONGEST_BY_TOTALTIME=3
+          export VFLAGS='-cc tcc -no-retry-compilation'
+          echo "::endgroup::"
+          # `all` runs every task, even after a failure, and lists the failed ones.
+          ./v run ci/openbsd_ci.vsh all
+
+  clang-openbsd:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Start OpenBSD VM for clang
+        id: vm-openbsd-clang
+        uses: cross-platform-actions/action@82668f1fbd89d9c99487604f822cbf6716f124d3 # v1.7.0
+        with:
+          operating_system: openbsd
+          version: '7.8'
+          memory: 8G
+          cpu_count: 2
+          sync_files: runner-to-vm
+
+      - name: Tests on OpenBSD with clang
+        id: tests-openbsd-clang
+        shell: cpa.sh {0}
+        run: |
+          set -eu
+          sudo pkg_add git sqlite3 gmake boehm-gc libiconv openssl
+          # Install packages needed to build examples
+          sudo pkg_add mariadb-client postgresql-client
+          # Mandatory: hostname not set in VM => some tests fail
+          sudo hostname -s openbsd-ci
+          echo "::group::OS infos"
+          uname -a
+          clang -v
+          echo "::endgroup::"
+          echo "::group::Build V"
+          git config --global --add safe.directory .
+          # Cold V3 builds of the fast tool reserve more than 4 GiB of data.
+          # Give compiler arenas 6 GiB within this 8 GiB VM.
+          ulimit -d 6291456
+          gmake
+          env VFLAGS= ./v -prod -cc cc -parallel-cc self
+          sudo ./v symlink
+          export VTEST_SHOW_LONGEST_BY_RUNTIME=3
+          export VTEST_SHOW_LONGEST_BY_COMPTIME=3
+          export VTEST_SHOW_LONGEST_BY_TOTALTIME=3
+          export VFLAGS='-cc clang'
+          echo "::endgroup::"
+          # `all` runs every task, even after a failure, and lists the failed ones.
+          ./v run ci/openbsd_ci.vsh all

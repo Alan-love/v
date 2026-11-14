@@ -1,0 +1,4458 @@
+module c
+
+import os
+import runtime
+import strings
+import time
+import v.flat
+import v.gen.c.naming
+import v.types
+import v.util
+import v.workers
+
+const max_flat_cgen_jobs = 18
+const max_small_flat_cgen_jobs = 10
+const large_flat_cgen_graph_items = 2048
+const max_flat_cgen_select_jobs = 15
+const min_flat_cgen_parallel_items = 128
+// Bound each worker's retained scratch while generating compiler-sized ASTs.
+// V3-generated compilers allocate temporary sum payloads while lowering each
+// expression. Keep self-host body batches narrow so those values are released
+// throughout cgen instead of accumulating across hundreds of functions.
+// Every batch starts with cold generator/checker caches (c names, parsed types,
+// interned types, local scopes), so too many batches re-derive the same facts:
+// 16 batches keep most of that warmth while still bounding the scratch.
+const scoped_cgen_worker_batches = 16
+const min_scoped_cgen_batch_cost = 16_384
+// Each dynamic chunk starts a worker batch with cold caches as well. Sixteen
+// chunks per job still let fast cores take over the work of slow or descheduled
+// ones; thirty-two retired 2% more instructions in the stage for the same
+// balance, eight keep 14 MB more scratch alive at the peak.
+const flat_cgen_chunks_per_job = 16
+
+// parallel_codegen_available keeps preparation and dispatch in the same mode
+// when the compilation's pool has no workers. Standalone generators retain
+// lazy pool creation when the runtime permits multiple jobs.
+fn (g &FlatGen) parallel_codegen_available() bool {
+	if !isnil(g.a.worker_pool) {
+		return g.a.worker_pool.size() > 0
+	}
+	return runtime.nr_jobs() > 1
+}
+
+// FlatCgenChunkArgs represents flat cgen chunk args data used by c.
+struct FlatCgenChunkArgs {
+	worker         voidptr
+	work_items_ptr voidptr
+	is_master      bool
+}
+
+struct FlatCgenCostArgs {
+	a         &flat.FlatAst
+	items_ptr voidptr
+	start     int
+	end       int
+	g         voidptr // &FlatGen, non-nil in fused prep mode (read-only access)
+	windows   bool    // Windows target, for the scan that runs without a FlatGen
+mut:
+	refs  map[string]bool
+	cands []FlatCgenPrepCandidate
+	scope voidptr // disposable arena holding refs/cands until the master replays them
+}
+
+struct FlatCgenDynamicArgs {
+	work_chunks_ptr voidptr
+	chunk_queue     chan int
+	reserve_cost    i64
+mut:
+	worker voidptr
+}
+
+struct CollectGenInfoFnPrepArgs {
+	g            voidptr // read-only &FlatGen master
+	node_ids_ptr voidptr // &[]i32
+	start        int
+	end          int
+	file         string
+	module_name  string
+	// registrations also builds each signature's alias registration.
+	registrations bool
+mut:
+	// The used function declarations of [start, end), in order.
+	positions []i32
+	preps     []CollectGenFnPrep
+	// Their alias registrations, when `registrations` is set.
+	signature_regs []FnSignatureRegistration
+}
+
+struct CollectGenInfoScanArgs {
+	g     voidptr // read-only &FlatGen master
+	start int
+	end   int
+	// parsed_end is the first synthesized node, see FlatGen.parsed_node_end.
+	parsed_end int
+mut:
+	counts            CollectGenInfoScanCounts
+	top_level_pos     int
+	string_pos        int
+	parsed_strings    int
+	type_metadata_pos int
+	embed_pos         int
+	sizeof_pos        int
+	top_levels_ptr    voidptr
+	strings_ptr       voidptr
+	type_metadata_ptr voidptr
+	embed_ptr         voidptr
+	sizeof_ptr        voidptr
+	// metadata_bits records the count pass's is_type_metadata_node results, one
+	// bit per node, so the fill pass does not classify every node again.
+	metadata_bits_ptr voidptr
+	// shared_bits marks the metadata nodes collect_local_shared_type_names visits.
+	shared_bits_ptr voidptr
+	type_text_cache &TypeMetadataTextCache = unsafe { nil }
+	// c_struct_refs: see FlatGen.expr_c_struct_refs.
+	c_struct_refs map[u32]bool
+}
+
+struct FnSignatureRegistrationArgs {
+	g                 voidptr
+	registrations_ptr voidptr
+	node_regs_ptr     voidptr
+	// Below fn_signature_registration_groups: a signature registration group;
+	// the three above it: register_fn_decl_nodes maps.
+	group int
+}
+
+struct FlatCgenSelectArgs {
+	g                       voidptr
+	nodes_ptr               voidptr
+	start                   int
+	end                     int
+	file                    string
+	module_name             string
+	direct_array_access_fns DirectArrayAccessFns
+	ignore_overflow_fns     DirectArrayAccessFns
+	program_modules         map[string]bool
+mut:
+	candidates []FlatFnGenCandidate
+	scope      voidptr
+}
+
+fn fn_signature_registration_thread(arg voidptr) voidptr {
+	a := unsafe { &FnSignatureRegistrationArgs(arg) }
+	mut g := unsafe { &FlatGen(a.g) }
+	if a.group >= fn_signature_registration_groups {
+		node_regs := unsafe { &[]FnDeclNodeReg(a.node_regs_ptr) }
+		g.register_fn_decl_nodes(*node_regs, a.group - fn_signature_registration_groups)
+		return unsafe { nil }
+	}
+	registration_lists := unsafe { &[][]FnSignatureRegistration(a.registrations_ptr) }
+	g.apply_fn_signature_registration_groups(*registration_lists, a.group)
+	return unsafe { nil }
+}
+
+fn flat_cgen_select_thread(arg voidptr) voidptr {
+	mut a := unsafe { &FlatCgenSelectArgs(arg) }
+	a.scope = cgen_worker_scope_begin(true)
+	master := unsafe { &FlatGen(a.g) }
+	mut view := master.new_collect_gen_info_view()
+	nodes := unsafe { &[]i32(a.nodes_ptr) }
+	a.candidates = view.collect_fn_gen_candidates_range(*nodes, a.start, a.end, a.file, a.module_name, a.direct_array_access_fns, a.ignore_overflow_fns, a.program_modules)
+	cgen_worker_scope_leave(a.scope)
+	return unsafe { nil }
+}
+
+fn collect_gen_info_fn_prep_thread(arg voidptr) voidptr {
+	mut a := unsafe { &CollectGenInfoFnPrepArgs(arg) }
+	master := unsafe { &FlatGen(a.g) }
+	mut view := master.new_collect_gen_info_view()
+	view.tc.cur_file = a.file
+	view.tc.cur_module = a.module_name
+	node_ids := unsafe { &[]i32(a.node_ids_ptr) }
+	// One compact entry per used declaration: an entry is some 300 bytes, and
+	// most top-level nodes are no used function.
+	mut n_fns := 0
+	for pos in a.start .. a.end {
+		if unsafe { view.a.nodes[node_ids[pos]].kind } == .fn_decl {
+			n_fns++
+		}
+	}
+	a.positions = []i32{cap: n_fns}
+	a.preps = []CollectGenFnPrep{cap: n_fns}
+	if a.registrations {
+		a.signature_regs = []FnSignatureRegistration{cap: n_fns}
+	}
+	mut cur_file := a.file
+	mut cur_module := a.module_name
+	for pos in a.start .. a.end {
+		node_idx := unsafe { node_ids[pos] }
+		node := view.a.nodes[node_idx]
+		if node.kind == .file {
+			cur_file = node.value
+			cur_module = 'main'
+		} else if node.kind == .module_decl {
+			cur_module = node.value
+		} else if node.kind == .fn_decl && (!view.has_used_fn_filter()
+			|| view.used_fn_contains_in_module(node.value, cur_module)) {
+			mut prep := view.compute_collect_gen_fn_prep(node, cur_module, cur_file)
+			if a.registrations {
+				full_name := qualify_name_in_module(cur_module, node.value)
+				a.signature_regs << view.fn_signature_registration_in_module(cur_module, node.value,
+					full_name, prep.ptypes, prep.shared_params, prep.decl_is_variadic, prep.first_param_is_mut,
+					prep.return_type)
+				prep.has_registration = true
+			}
+			a.positions << i32(pos)
+			a.preps << moved_collect_gen_fn_prep(prep)
+		}
+	}
+	return unsafe { nil }
+}
+
+@[direct_array_access]
+fn collect_gen_info_scan_count_thread(arg voidptr) voidptr {
+	mut a := unsafe { &CollectGenInfoScanArgs(arg) }
+	g := unsafe { &FlatGen(a.g) }
+	incremental := g.incremental_fn_names.len > 0
+	mut metadata_bits := unsafe { &[]u64(a.metadata_bits_ptr) }
+	mut shared_bits := unsafe { &[]u64(a.shared_bits_ptr) }
+	for node_idx in a.start .. a.end {
+		// The scan only reads the AST; borrow the node instead of copying it.
+		node := unsafe { &g.a.nodes[node_idx] }
+		class := cgen_kind_class(node.kind)
+		if is_type_metadata_node_of_class(node, class, mut a.type_text_cache) {
+			a.type_metadata_pos++
+			unsafe {
+				metadata_bits[node_idx >> 6] |= u64(1) << (node_idx & 63)
+			}
+			if shared_scan_node_relevant(g.a, node) {
+				unsafe {
+					shared_bits[node_idx >> 6] |= u64(1) << (node_idx & 63)
+				}
+			}
+		}
+		if class & cgen_kind_class_string_literal != 0 {
+			if node.is_embed_payload() {
+				a.embed_pos++
+			} else {
+				a.string_pos++
+				if node_idx < a.parsed_end {
+					a.parsed_strings++
+				}
+			}
+		}
+		if class & cgen_kind_class_top_level != 0 {
+			a.top_level_pos++
+		}
+		if class & cgen_kind_class_sizeof_ref != 0
+			&& (node.kind == .offsetof_expr || node.children_count == 0) {
+			a.sizeof_pos++
+		}
+		if class & (cgen_kind_class_top_level | cgen_kind_class_metadata) == 0 {
+			continue
+		}
+		match node.kind {
+			.fn_decl {
+				if !incremental || g.incremental_fn_names[node.value] {
+					a.counts.fn_count++
+				}
+			}
+			.struct_decl {
+				a.counts.struct_count++
+			}
+			.global_decl {
+				a.counts.global_count += int(node.children_count)
+			}
+			.const_decl {
+				a.counts.const_count += int(node.children_count)
+			}
+			.enum_decl {
+				a.counts.enum_field_count += int(node.children_count)
+			}
+			.interface_decl {
+				a.counts.interface_count++
+			}
+			.import_decl {
+				a.counts.import_count++
+			}
+			else {}
+		}
+	}
+	g.collect_expr_c_struct_type_refs_in(a.start, a.end, mut a.c_struct_refs)
+	return unsafe { nil }
+}
+
+@[direct_array_access]
+fn collect_gen_info_scan_fill_thread(arg voidptr) voidptr {
+	mut a := unsafe { &CollectGenInfoScanArgs(arg) }
+	g := unsafe { &FlatGen(a.g) }
+	mut top_levels := unsafe { &[]i32(a.top_levels_ptr) }
+	mut literals := unsafe { &[]string(a.strings_ptr) }
+	mut type_metadata := unsafe { &[]i32(a.type_metadata_ptr) }
+	mut embeds := unsafe { &[]i32(a.embed_ptr) }
+	mut sizeofs := unsafe { &[]i32(a.sizeof_ptr) }
+	mut top_level_pos := a.top_level_pos
+	mut string_pos := a.string_pos
+	mut type_metadata_pos := a.type_metadata_pos
+	mut embed_pos := a.embed_pos
+	mut sizeof_pos := a.sizeof_pos
+	metadata_bits := unsafe { &[]u64(a.metadata_bits_ptr) }
+	for node_idx in a.start .. a.end {
+		if unsafe { metadata_bits[node_idx >> 6] } & (u64(1) << (node_idx & 63)) != 0 {
+			unsafe {
+				type_metadata[type_metadata_pos] = node_idx
+			}
+			type_metadata_pos++
+		}
+		// The fill only reads the AST; borrow the node instead of copying it.
+		node := unsafe { &g.a.nodes[node_idx] }
+		class := cgen_kind_class(node.kind)
+		if class & cgen_kind_class_string_literal != 0 {
+			if node.is_embed_payload() {
+				unsafe {
+					embeds[embed_pos] = node_idx
+				}
+				embed_pos++
+			} else {
+				unsafe {
+					literals[string_pos] = node.value
+				}
+				string_pos++
+			}
+		}
+		if class & cgen_kind_class_top_level != 0 {
+			unsafe {
+				top_levels[top_level_pos] = node_idx
+			}
+			top_level_pos++
+		}
+		if class & cgen_kind_class_sizeof_ref != 0
+			&& (node.kind == .offsetof_expr || node.children_count == 0) {
+			unsafe {
+				sizeofs[sizeof_pos] = node_idx
+			}
+			sizeof_pos++
+		}
+	}
+	return unsafe { nil }
+}
+
+fn flat_cgen_cost_thread(arg voidptr) voidptr {
+	mut a := unsafe { &FlatCgenCostArgs(arg) }
+	// Costs are written into the shared item array; the collected refs and
+	// candidates are replayed by the master, which then frees this arena.
+	a.scope = cgen_worker_scope_begin(true)
+	flat_cgen_cost_range(mut a)
+	cgen_worker_scope_leave(a.scope)
+	return unsafe { nil }
+}
+
+fn flat_cgen_cost_range(mut a FlatCgenCostArgs) {
+	mut items := unsafe { &[]FlatFnGenItem(a.items_ptr) }
+	mut stack := []flat.NodeId{cap: 256}
+	if !isnil(a.g) {
+		// Fused prep mode: also collect the fn-ptr preseed candidates the
+		// master replays in order after the join (see refine_fn_item_costs).
+		g := unsafe { &FlatGen(a.g) }
+		mut text_cache := &PrepTypTextCache{}
+		mut type_seen := &PreseedTypeSeen{}
+		mut resolved_call_cache := &ResolvedCallTypeCache{}
+		mut cur_file := ''
+		mut cur_module := ''
+		for idx in a.start .. a.end {
+			unsafe {
+				item_file := items[idx].file
+				item_module := items[idx].module
+				if item_file != cur_file || item_module != cur_module {
+					cur_file = item_file
+					cur_module = item_module
+					text_cache.generation++
+				}
+				cost, needs_prelude_scan := exact_flat_fn_gen_item_cost_and_prep(g, items[idx].node_id, idx, mut a.refs, mut stack, mut a.cands, mut text_cache, mut type_seen, mut resolved_call_cache)
+				items[idx].cost = cost
+				items[idx].skip_prelude_scan = !needs_prelude_scan
+			}
+		}
+		return
+	}
+	for idx in a.start .. a.end {
+		unsafe {
+			cost, needs_prelude_scan := exact_flat_fn_gen_item_cost(a.a, items[idx].node_id, a.windows, mut a.refs, mut stack)
+			items[idx].cost = cost
+			items[idx].skip_prelude_scan = !needs_prelude_scan
+		}
+	}
+	return
+}
+
+// precompute_consts_scoped lowers every const initializer on a private worker
+// inside a disposable arena. The emitter's expression scratch (fixed-array
+// tables, type lookups, name buffers) is by far the largest garbage this
+// pool thread would otherwise leave in its persistent arena; only the C text,
+// the runtime-init queue and the usual batch side tables are published.
+fn (mut g FlatGen) precompute_consts_scoped() {
+	if !g.scope_parallel_workers {
+		g.parallel_const_code = g.precompute_consts()
+		return
+	}
+	// The dependency order comes from the master, whose memos are warm; a
+	// fresh worker would rescan the AST for every const reference.
+	names := g.const_emission_order_owned()
+	scope := cgen_worker_scope_begin(true)
+	mut worker := g.new_parallel_worker(max_flat_cgen_jobs + 2)
+	// Const initializers number their temporaries from the master counter.
+	worker.tmp_count = g.tmp_count
+	// emit_const resolves file-local import aliases in the declaring file;
+	// body workers never need that table, so the fork does not carry it.
+	worker.const_files = g.const_files.clone()
+	const_code := worker.precompute_consts_in_order(names)
+	cgen_worker_scope_leave(scope)
+	g.parallel_const_code = const_code.clone()
+	g.tmp_count = worker.tmp_count
+	// The worker started from a copy of the master's init queue and an empty
+	// module list, so its new entries are inits[base..] paired with modules[0..].
+	base := g.const_runtime_inits.len
+	for i in base .. worker.const_runtime_inits.len {
+		g.const_runtime_inits << worker.const_runtime_inits[i].clone()
+		mod_idx := i - base
+		g.const_runtime_init_modules << if mod_idx < worker.const_runtime_init_modules.len {
+			worker.const_runtime_init_modules[mod_idx].clone()
+		} else {
+			''
+		}
+	}
+	g.absorb_scoped_cgen_batch(worker, true)
+	cgen_worker_scope_free(scope)
+}
+
+// ForwardDeclLaneArgs is one contiguous range of function prototypes that a
+// private generator emits beside the type declaration task.
+struct ForwardDeclLaneArgs {
+	worker    voidptr
+	items_ptr voidptr
+	start     int
+	end       int
+mut:
+	output string
+}
+
+fn forward_decl_lane_thread(arg voidptr) voidptr {
+	mut a := unsafe { &ForwardDeclLaneArgs(arg) }
+	mut w := unsafe { &FlatGen(a.worker) }
+	items := unsafe { &[]FlatFnGenItem(a.items_ptr) }
+	fdsw := time.new_stopwatch()
+	w.sb = strings.new_builder((a.end - a.start) * 96)
+	w.line_start = true
+	w.forward_decl_batches(*items, a.start, a.end)
+	// Hand the builder storage over instead of copying every prototype once more
+	// into this pool thread's arena.
+	a.output = cgen_take_builder_text(mut w.sb)
+	w.sb = strings.new_builder(0)
+	w.timing_profile('  [ttime]     cg fwd decls   ${f64(fdsw.elapsed().microseconds()) / 1000.0:7.2f} ms (task, items: ${a.end - a.start})')
+	return unsafe { nil }
+}
+
+// forward_decl_lane_bounds splits prototypes into contiguous lanes with roughly
+// equal estimated emit cost. Item count alone leaves one lane several times
+// slower for generic-heavy programs because signature cost varies widely.
+fn forward_decl_lane_bounds(a &flat.FlatAst, items []FlatFnGenItem) []int {
+	n_items := items.len
+	if n_items == 0 {
+		return [0, 0]
+	}
+	n_batches := (n_items + 1023) / 1024
+	if n_batches < 4 {
+		return [0, n_items]
+	}
+	n_lanes := 8
+	mut total_cost := i64(0)
+	for item in items {
+		node := a.nodes[int(item.node_id)]
+		total_cost += i64(item.c_name.len * 4 + int(node.children_count) * 32 + 64)
+	}
+	target := total_cost / n_lanes
+	if target <= 0 {
+		mut count_bounds := []int{cap: n_lanes + 1}
+		for lane in 0 .. n_lanes {
+			count_bounds << n_items * lane / n_lanes
+		}
+		count_bounds << n_items
+		return count_bounds
+	}
+	mut running_cost := i64(0)
+	mut bounds := [0]
+	mut lane := 1
+	for i, item in items {
+		node := a.nodes[int(item.node_id)]
+		running_cost += i64(item.c_name.len * 4 + int(node.children_count) * 32 + 64)
+		if lane < n_lanes && running_cost >= target * lane {
+			boundary := i + 1
+			if boundary < n_items && bounds.last() != boundary {
+				bounds << boundary
+			}
+			for lane < n_lanes && running_cost >= target * lane {
+				lane++
+			}
+		}
+	}
+	if bounds.last() != n_items {
+		bounds << n_items
+	}
+	// A single expensive item can cross several cost targets. Skipping those
+	// boundaries leaves fewer, non-empty lanes instead of duplicating bounds.
+	return bounds
+}
+
+fn parallel_type_decls_thread(arg voidptr) voidptr {
+	mut w := unsafe { &FlatGen(arg) }
+	// Body dispatchers fork from the master's checker while this task resolves
+	// declaration types. Some synchronous checker queries temporarily move
+	// function-local state such as `smartcasts`; use a private checker here so
+	// the snapshot observed by body workers remains immutable.
+	master_tc := w.tc
+	w.tc = w.clone_parallel_type_checker()
+	tdsw := time.new_stopwatch()
+	defer {
+		w.tc = master_tc
+		w.timing_profile('  [ttime]     cg typedecls   ${f64(tdsw.elapsed().microseconds()) / 1000.0:7.2f} ms (task)')
+	}
+	// This task uses the master generator from a pool thread, so memoize into
+	// private caches: entries written here would otherwise borrow this
+	// thread's arena, and body lanes clone the master's memo maps meanwhile.
+	saved_lookup_caches := w.begin_scratch_lookup_caches()
+	// Self-host declaration output is several MiB. Reserve it once instead of
+	// repeatedly copying a geometrically growing builder.
+	w.sb.ensure_cap(4 * 1024 * 1024)
+	mut tdpsw := time.new_stopwatch()
+	w.precompute_consts_scoped()
+	w.timing_profile('  [ttime]       td consts    ${f64(tdpsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	tdpsw.restart()
+	w.gen_translation_unit_prefix()
+	w.gen_type_declaration_block()
+	w.timing_profile('  [ttime]       td prefix+type ${f64(tdpsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	// The reserved builder holds only this text; keep it instead of copying it.
+	w.parallel_type_decls = cgen_take_builder_text(mut w.sb)
+	w.sb = strings.new_builder(4096)
+	tdpsw.restart()
+	w.gen_global_declaration_block()
+	w.parallel_global_decls = w.sb.str()
+	unsafe { w.sb.free() }
+	w.sb = strings.new_builder(4096)
+	w.timing_profile('  [ttime]       td globals    ${f64(tdpsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	tdpsw.restart()
+	if w.parallel_forward_decl_lanes {
+		// The function prototypes are generated on their own pool lanes.
+		w.forward_decls_tail()
+	} else {
+		w.forward_decls()
+	}
+	w.timing_profile('  [ttime]       td fwd decls ${f64(tdpsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	w.parallel_forward_decls = w.sb.str()
+	unsafe { w.sb.free() }
+	w.sb = strings.new_builder(4096)
+	tdpsw.restart()
+	w.gen_pre_body_support_declarations()
+	w.parallel_support_decls = w.sb.str()
+	unsafe { w.sb.free() }
+	w.sb = strings.new_builder(4096)
+	w.timing_profile('  [ttime]       td support   ${f64(tdpsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	tdpsw.restart()
+	if !w.skip_enum_autostr {
+		w.enum_str_defs()
+		w.parallel_enum_str_defs = w.sb.str()
+		unsafe { w.sb.free() }
+		w.sb = strings.new_builder(4096)
+	}
+	w.timing_profile('  [ttime]       td enum str  ${f64(tdpsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	tdpsw.restart()
+	// Tail generation uses a full private worker. The master generator is also
+	// the declaration task, while body lanes concurrently read its frozen
+	// tables; running these emitters on the master would mutate shared name and
+	// type caches. The private worker keeps those writes isolated while its
+	// already-complete const/global metadata is read-only.
+	// The tail worker is private, so its scratch can live in a disposable
+	// arena; only its two output texts are published into this thread's arena.
+	tail_scope := cgen_worker_scope_begin(w.scope_parallel_workers)
+	mut tail := w.new_parallel_tail_worker(max_flat_cgen_jobs + 1)
+	if !w.cache_split {
+		// The master's literal table is complete up to here: the declarations
+		// above added their literals, and later ones (from the function bodies)
+		// are appended after the join. Emit the definitions of this prefix and
+		// the embedded file blobs, which only depend on the AST, on this task
+		// instead of serially after the function bodies.
+		n_literals := w.str_lits.len
+		tail.sb = strings.new_builder(n_literals * 48 + 4096)
+		for i in 0 .. n_literals {
+			tail.write_string_literal_def(i, tail.str_lits[i])
+		}
+		w.parallel_string_literal_defs = cgen_publish_builder_text(mut tail.sb, tail_scope)
+		w.parallel_string_literal_count = n_literals
+		tail.sb = strings.new_builder(4096)
+		tail.gen_embed_file_blobs()
+		w.parallel_embed_blobs = cgen_publish_builder_text(mut tail.sb, tail_scope)
+		w.parallel_embed_blobs_ready = true
+		tail.sb = strings.new_builder(4096)
+		w.timing_profile('  [ttime]       td literals  ${f64(tdpsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+		tdpsw.restart()
+		tail.interface_method_stubs()
+		w.parallel_interface_stubs = cgen_publish_builder_text(mut tail.sb, tail_scope)
+		tail.sb = strings.new_builder(4096)
+	}
+	w.timing_profile('  [ttime]       td iface defs ${f64(tdpsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	tdpsw.restart()
+	if w.print_fn_names.len == 0 {
+		tail.gen_vinit()
+		tail.gen_vcleanup()
+		w.parallel_init_defs = cgen_publish_builder_text(mut tail.sb, tail_scope)
+		tail.sb = strings.new_builder(0)
+	}
+	cgen_worker_scope_leave(tail_scope)
+	cgen_worker_scope_free(tail_scope)
+	w.timing_profile('  [ttime]       td init defs  ${f64(tdpsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	w.restore_scratch_lookup_caches(saved_lookup_caches)
+	w.parallel_support_ready = true
+	return unsafe { nil }
+}
+
+// fixed_storage_scan_thread runs the fixed-storage-const use scan (a full
+// post-transform AST pass) on a private fork while the master collects the
+// fn work items and pre-seeds the parallel tables.
+fn fixed_storage_scan_thread(arg voidptr) voidptr {
+	mut w := unsafe { &FlatGen(arg) }
+	mut fssw := time.new_stopwatch()
+	scope := cgen_worker_scope_begin(w.scope_parallel_workers)
+	w.collect_fixed_storage_consts(true)
+	w.timing_profile('  [ttime]       fs consts     ${f64(fssw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	fssw.restart()
+	w.precompute_concrete_optional_abi_fns()
+	w.timing_profile('  [ttime]       fs opt abi    ${f64(fssw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	w.worker_scope = scope
+	cgen_worker_scope_leave(scope)
+	return unsafe { nil }
+}
+
+// fixed_array_support_thread moves the independent whole-AST fixed-array
+// discovery out of the serial type-declaration task.
+fn fixed_array_support_thread(arg voidptr) voidptr {
+	mut w := unsafe { &FlatGen(arg) }
+	fsw := time.new_stopwatch()
+	scope := cgen_worker_scope_begin(w.scope_parallel_workers)
+	_ = w.collect_fixed_array_typedefs_needed()
+	w.timing_profile('  [ttime]       fs fixed types ${f64(fsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	w.worker_scope = scope
+	cgen_worker_scope_leave(scope)
+	return unsafe { nil }
+}
+
+// Declaration signatures and unresolved calls use independent read-only inputs;
+// collect their optional typedefs on separate lanes and join before dispatch.
+fn optional_support_thread(arg voidptr) voidptr {
+	mut w := unsafe { &FlatGen(arg) }
+	osw := time.new_stopwatch()
+	scope := cgen_worker_scope_begin(w.scope_parallel_workers)
+	w.collect_declaration_signature_types()
+	w.optional_types_ready = true
+	w.timing_profile('  [ttime]       fs opt types   ${f64(osw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	w.worker_scope = scope
+	cgen_worker_scope_leave(scope)
+	return unsafe { nil }
+}
+
+struct OptionalSelectionArgs {
+	worker voidptr
+	items  chan []FlatFnGenItem
+}
+
+fn checker_signature_support_thread(arg voidptr) voidptr {
+	mut w := unsafe { &FlatGen(arg) }
+	scope := cgen_worker_scope_begin(w.scope_parallel_workers)
+	w.collect_checker_declaration_signature_types()
+	w.worker_scope = scope
+	cgen_worker_scope_leave(scope)
+	return unsafe { nil }
+}
+
+// Start declaration discovery while the master selects functions. The channel
+// publishes a stable snapshot before this lane reads the selected signatures.
+fn optional_support_selection_thread(arg voidptr) voidptr {
+	a := unsafe { &OptionalSelectionArgs(arg) }
+	mut w := unsafe { &FlatGen(a.worker) }
+	osw := time.new_stopwatch()
+	scope := cgen_worker_scope_begin(w.scope_parallel_workers)
+	old_module := w.tc.cur_module
+	old_file := w.tc.cur_file
+	if !w.decl_types_ready {
+		w.collect_specialized_declaration_signature_types()
+		// Checker signatures and expression types do not depend on selection.
+		// Give that scan its own checker/cache state while selected items arrive.
+		mut metadata := w.new_parallel_worker(0)
+		metadata.c_name_cache = &CNameCache{}
+		metadata.generic_app_cache = &GenericAppCache{}
+		metadata.needed_optional_types = flat.TypeTextBindings{}
+		metadata.optional_pointer_struct_tags = map[string]string{}
+		metadata_thread := spawn checker_signature_support_thread(voidptr(metadata))
+		// Resolve every declaration's signature while the master selects; the
+		// selected subset is only registered once it arrives.
+		signatures := w.precompute_fn_decl_signature_types()
+		w.fn_gen_items = <-a.items
+		w.collect_selected_declaration_signature_types_from(&signatures)
+		// The items are the final selection: the declaration task does not have
+		// to walk their signatures again.
+		w.selected_decl_types_ready = true
+		metadata_thread.wait()
+		// Preserve the serial precedence: source specializations, selected
+		// signatures, then checker metadata. Tuple emission deduplicates names.
+		for name, payload_id in metadata.needed_optional_types.ids {
+			w.needed_optional_types.set_id(name, payload_id)
+		}
+		for name, payload in metadata.optional_pointer_struct_tags {
+			w.optional_pointer_struct_tags[name] = payload
+		}
+		w.multi_return_types << metadata.multi_return_types
+		for name, enabled in metadata.multi_return_type_names {
+			w.multi_return_type_names[name] = enabled
+		}
+		if metadata.worker_scope != unsafe { nil } {
+			w.parallel_worker_scopes << metadata.worker_scope
+		}
+		w.decl_types_ready = true
+		w.multi_return_types_ready = true
+	} else {
+		w.fn_gen_items = <-a.items
+	}
+	w.tc.cur_module = old_module
+	w.tc.cur_file = old_file
+	w.optional_types_ready = true
+	w.timing_profile('  [ttime]       fs opt types   ${f64(osw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	w.worker_scope = scope
+	cgen_worker_scope_leave(scope)
+	return unsafe { nil }
+}
+
+struct FnGenItemKeySortArgs {
+mut:
+	keys []FlatFnGenItemSortKey
+}
+
+fn fn_gen_item_key_sort_thread(arg voidptr) voidptr {
+	mut a := unsafe { &FnGenItemKeySortArgs(arg) }
+	a.keys.sort(a.c_name < b.c_name)
+	return unsafe { nil }
+}
+
+// sorted_fn_gen_item_keys returns the keys stably sorted by C name, like
+// `keys.sort(a.c_name < b.c_name)`. Large inputs are split into consecutive
+// parts that are sorted on the pool and merged, ties taken from the earlier
+// part, so equal names keep their input order.
+fn (g &FlatGen) sorted_fn_gen_item_keys(keys []FlatFnGenItemSortKey) []FlatFnGenItemSortKey {
+	if keys.len < 4096 || isnil(g.a.worker_pool) || g.a.worker_pool.size() < 4 {
+		mut sorted := keys.clone()
+		sorted.sort(a.c_name < b.c_name)
+		return sorted
+	}
+	n_parts := 8
+	mut parts := []FnGenItemKeySortArgs{cap: n_parts}
+	for part in 0 .. n_parts {
+		parts << FnGenItemKeySortArgs{
+			keys: keys[keys.len * part / n_parts..keys.len * (part + 1) / n_parts].clone()
+		}
+	}
+	mut tasks := []workers.Task{cap: n_parts}
+	for part in 0 .. n_parts {
+		tasks << workers.Task{
+			run:        fn_gen_item_key_sort_thread
+			arg:        unsafe { voidptr(&parts[part]) }
+			force_sync: part == 0
+		}
+	}
+	g.a.worker_pool.run(tasks)
+	mut runs := [][]FlatFnGenItemSortKey{cap: n_parts}
+	for part in parts {
+		runs << moved_fn_gen_item_sort_keys(part.keys)
+	}
+	for runs.len > 1 {
+		mut merged := [][]FlatFnGenItemSortKey{cap: (runs.len + 1) / 2}
+		for i := 0; i < runs.len; i += 2 {
+			if i + 1 < runs.len {
+				merged << merge_fn_gen_item_sort_keys(runs[i], runs[i + 1])
+			} else {
+				merged << moved_fn_gen_item_sort_keys(runs[i])
+			}
+		}
+		runs = moved_fn_gen_item_sort_runs(merged)
+	}
+	return runs[0]
+}
+
+// merge_fn_gen_item_sort_keys merges two sorted runs; on equal names the key of
+// `first` comes first.
+fn merge_fn_gen_item_sort_keys(first []FlatFnGenItemSortKey, second []FlatFnGenItemSortKey) []FlatFnGenItemSortKey {
+	mut out := []FlatFnGenItemSortKey{cap: first.len + second.len}
+	mut i := 0
+	mut j := 0
+	for i < first.len && j < second.len {
+		if second[j].c_name < first[i].c_name {
+			out << moved_fn_gen_item_sort_key(second[j])
+			j++
+		} else {
+			out << moved_fn_gen_item_sort_key(first[i])
+			i++
+		}
+	}
+	for i < first.len {
+		out << moved_fn_gen_item_sort_key(first[i])
+		i++
+	}
+	for j < second.len {
+		out << moved_fn_gen_item_sort_key(second[j])
+		j++
+	}
+	return out
+}
+
+@[inline]
+fn moved_fn_gen_item_sort_keys(keys []FlatFnGenItemSortKey) []FlatFnGenItemSortKey {
+	return keys
+}
+
+@[inline]
+fn moved_fn_gen_item_sort_runs(runs [][]FlatFnGenItemSortKey) [][]FlatFnGenItemSortKey {
+	return runs
+}
+
+// moved_fn_gen_item_sort_key returns `key`; pushing a call result does not
+// copy its name.
+@[inline]
+fn moved_fn_gen_item_sort_key(key FlatFnGenItemSortKey) FlatFnGenItemSortKey {
+	return key
+}
+
+// TypeIndexArgs carries the read-only type indexes that a helper thread builds
+// from the checker's (complete) type tables while collect_gen_info runs;
+// `scope` holds their storage until cgen output is done.
+struct TypeIndexArgs {
+	tc      &types.TypeChecker
+	n_nodes int
+mut:
+	scope       voidptr
+	field_index &StructFieldIndexBase = unsafe { nil }
+	type_names  &TypeNameShortIndex   = unsafe { nil }
+	call_names  SparseCallNameIndex
+}
+
+fn type_index_thread(arg voidptr) voidptr {
+	mut a := unsafe { &TypeIndexArgs(arg) }
+	a.scope = cgen_worker_scope_begin(true)
+	a.field_index = new_struct_field_index_base(a.tc.structs)
+	a.type_names = new_type_name_short_index(a.tc)
+	a.call_names = new_sparse_call_name_index(a.tc, a.n_nodes)
+	cgen_worker_scope_leave(a.scope)
+	return unsafe { nil }
+}
+
+// start_type_indexes builds the shared struct field and type-name indexes on a
+// helper thread; finish_type_indexes installs them. Only parallel generation
+// uses them.
+fn (mut g FlatGen) start_type_indexes(no_parallel bool) (&TypeIndexArgs, []thread voidptr) {
+	mut args := &TypeIndexArgs{
+		tc:      g.tc
+		n_nodes: g.a.nodes.len
+	}
+	mut threads := []thread voidptr{cap: 1}
+	if !no_parallel && g.scope_parallel_workers && g.incremental_fn_names.len == 0 {
+		threads << spawn type_index_thread(voidptr(args))
+	}
+	return args, threads
+}
+
+fn (mut g FlatGen) finish_type_indexes(args &TypeIndexArgs, threads []thread voidptr) {
+	if threads.len == 0 {
+		return
+	}
+	_ = threads.wait()
+	g.struct_field_index_base = args.field_index
+	g.type_name_short_index = args.type_names
+	g.install_sparse_call_name_index(args.call_names)
+	if args.scope != unsafe { nil } {
+		g.parallel_worker_scopes << args.scope
+	}
+}
+
+// EmbeddedFieldsLane builds FlatGen.embedded_fields_by_type on a helper thread
+// while collect_gen_info runs. `scope` holds the table until cgen output is done.
+struct EmbeddedFieldsLane {
+	g &FlatGen // read-only
+mut:
+	threads  []thread voidptr
+	scope    voidptr
+	fields   map[u32][]types.StructField
+	deferred []u32
+}
+
+fn embedded_fields_lane_thread(arg voidptr) voidptr {
+	mut lane := unsafe { &EmbeddedFieldsLane(arg) }
+	lane.scope = cgen_worker_scope_begin(true)
+	lane.fields, lane.deferred = lane.g.embedded_fields_without_context()
+	cgen_worker_scope_leave(lane.scope)
+	return unsafe { nil }
+}
+
+// start_embedded_fields_lane starts precompute_embedded_fields beside
+// collect_gen_info: the table only depends on the checker's struct table, apart
+// from the few structs that finish_embedded_fields_lane redoes on the master.
+fn (mut g FlatGen) start_embedded_fields_lane(no_parallel bool) {
+	g.embedded_fields_lane = unsafe { nil }
+	if no_parallel || !g.scope_parallel_workers || g.incremental_fn_names.len > 0 {
+		return
+	}
+	mut lane := &EmbeddedFieldsLane{
+		g: g
+	}
+	lane.threads << spawn embedded_fields_lane_thread(voidptr(lane))
+	g.embedded_fields_lane = voidptr(lane)
+}
+
+// finish_embedded_fields_lane installs the table of a started lane and reports
+// whether there was one. It runs where precompute_embedded_fields would, so the
+// structs left to the master are resolved in the same checker context.
+fn (mut g FlatGen) finish_embedded_fields_lane() bool {
+	if isnil(g.embedded_fields_lane) {
+		return false
+	}
+	mut lane := unsafe { &EmbeddedFieldsLane(g.embedded_fields_lane) }
+	g.embedded_fields_lane = unsafe { nil }
+	lane.threads.wait()
+	if lane.scope != unsafe { nil } {
+		g.parallel_worker_scopes << lane.scope
+	}
+	g.embedded_fields_by_type = lane.fields.move()
+	for name_id in lane.deferred {
+		g.embedded_fields_by_type[name_id] = g.embedded_fields_of(g.tc.structs[name_id] or {
+			[]types.StructField{}
+		})
+	}
+	return true
+}
+
+// ParamTypeIndexArgs carries the short-name parameter type index
+// (precompute_param_type_index) built beside the pre-dispatch helpers.
+struct ParamTypeIndexArgs {
+	g  &FlatGen
+	tc &types.TypeChecker
+mut:
+	scope                voidptr
+	param_types_by_short map[string][]types.Type
+}
+
+fn param_type_index_thread(arg voidptr) voidptr {
+	mut a := unsafe { &ParamTypeIndexArgs(arg) }
+	a.scope = cgen_worker_scope_begin(true)
+	a.param_types_by_short = cgen_param_types_by_short(a.g.fn_decl_param_types, a.tc.fn_param_types)
+	cgen_worker_scope_leave(a.scope)
+	return unsafe { nil }
+}
+
+fn unresolved_call_optional_thread(arg voidptr) voidptr {
+	mut w := unsafe { &FlatGen(arg) }
+	usw := time.new_stopwatch()
+	scope := cgen_worker_scope_begin(w.scope_parallel_workers)
+	w.collect_unresolved_call_optional_types()
+	w.timing_profile('  [ttime]       fs call opts   ${f64(usw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	w.worker_scope = scope
+	cgen_worker_scope_leave(scope)
+	return unsafe { nil }
+}
+
+// InterfaceBoxingScanArgs is one slice of the interface-literal pre-filter.
+struct InterfaceBoxingScanArgs {
+	a     &flat.FlatAst = unsafe { nil }
+	ids   []i32
+	start int
+	end   int
+mut:
+	found []i32
+}
+
+fn interface_boxing_scan_thread(arg voidptr) voidptr {
+	mut a := unsafe { &InterfaceBoxingScanArgs(arg) }
+	a.found = interface_boxing_candidates_in(a.a, a.ids, a.start, a.end)
+	return unsafe { nil }
+}
+
+// interface_boxing_candidate_nodes narrows the type-metadata nodes to lowered
+// interface literals before collect_interface_boxed_types_for_dispatch resolves
+// their names. Nearly every metadata node is rejected by the structural test,
+// so large ASTs split it over the worker pool and keep the slices in node order.
+fn (g &FlatGen) interface_boxing_candidate_nodes() []i32 {
+	ids := g.type_metadata_nodes()
+	if ids.len < min_parallel_interface_boxing_scan || isnil(g.a.worker_pool)
+		|| g.a.worker_pool.size() == 0 {
+		return interface_boxing_candidates_in(g.a, ids, 0, ids.len)
+	}
+	n_jobs := g.a.worker_pool.size() + 1
+	chunk := (ids.len + n_jobs - 1) / n_jobs
+	mut args := []InterfaceBoxingScanArgs{cap: n_jobs}
+	for start := 0; start < ids.len; start += chunk {
+		args << InterfaceBoxingScanArgs{
+			a:     g.a
+			ids:   ids
+			start: start
+			end:   int_min(start + chunk, ids.len)
+		}
+	}
+	mut tasks := []workers.Task{cap: args.len}
+	for i in 0 .. args.len {
+		tasks << workers.Task{
+			run:        interface_boxing_scan_thread
+			arg:        unsafe { voidptr(&args[i]) }
+			force_sync: i == 0
+		}
+	}
+	g.a.worker_pool.run(tasks)
+	mut found := []i32{}
+	for arg in args {
+		found << arg.found
+	}
+	return found
+}
+
+const min_parallel_interface_boxing_scan = 8192
+
+// new_interface_impl_scan_worker forks the worker for interface_impl_scan_thread.
+// That scan runs beside the master's declaration pre-seeding, which writes the
+// master's C-name cache, so the worker keeps its names in a private cache instead
+// of reading the master's through `base`.
+fn (g &FlatGen) new_interface_impl_scan_worker() &FlatGen {
+	mut worker := g.new_parallel_worker(4)
+	worker.c_name_cache = &CNameCache{}
+	worker.interface_boxed_types = map[u64]bool{}
+	worker.interface_boxed_types_done = false
+	worker.iface_impls = map[u32][]u32{}
+	worker.iface_type_ids = map[u64]int{}
+	worker.ierror_method_emit_names = map[string]bool{}
+	return worker
+}
+
+// interface_impl_scan_thread builds the structural-interface dispatch tables
+// while the master pre-seeds independent declaration metadata.
+fn interface_impl_scan_thread(arg voidptr) voidptr {
+	mut w := unsafe { &FlatGen(arg) }
+	scope := cgen_worker_scope_begin(w.scope_parallel_workers)
+	w.collect_interface_impls()
+	w.worker_scope = scope
+	cgen_worker_scope_leave(scope)
+	return arg
+}
+
+fn fixed_array_ret_wrappers_thread(arg voidptr) voidptr {
+	mut w := unsafe { &FlatGen(arg) }
+	scope := cgen_worker_scope_begin(w.scope_parallel_workers)
+	w.populate_fixed_array_ret_wrappers()
+	w.worker_scope = scope
+	cgen_worker_scope_leave(scope)
+	return unsafe { nil }
+}
+
+fn cgen_support_precompute_thread(arg voidptr) voidptr {
+	mut w := unsafe { &FlatGen(arg) }
+	scope := cgen_worker_scope_begin(w.scope_parallel_workers)
+	w.precompute_ownership_recursive_drop_helpers()
+	w.precompute_fixed_array_map_key_types()
+	w.worker_scope = scope
+	cgen_worker_scope_leave(scope)
+	return unsafe { nil }
+}
+
+fn pre_dispatch_master_thread(arg voidptr) voidptr {
+	mut g := unsafe { &FlatGen(arg) }
+	g.prepare_pre_dispatch_master()
+	return unsafe { nil }
+}
+
+// flat_cgen_chunk_thread supports flat cgen chunk thread handling for c.
+fn flat_cgen_chunk_thread(arg voidptr) voidptr {
+	a := unsafe { &FlatCgenChunkArgs(arg) }
+	mut w := unsafe { &FlatGen(a.worker) }
+	items := unsafe { &[]FlatFnGenItem(a.work_items_ptr) }
+	if w.scope_parallel_workers {
+		if a.is_master {
+			w.gen_fn_items_scoped_master_batches(*items)
+		} else {
+			w.gen_fn_items_scoped_batches(*items)
+		}
+	} else {
+		w.gen_fn_items(*items)
+	}
+	return unsafe { nil }
+}
+
+fn flat_cgen_dynamic_thread(arg voidptr) voidptr {
+	mut a := unsafe { &FlatCgenDynamicArgs(arg) }
+	mut w := unsafe { &FlatGen(a.worker) }
+	chunks := unsafe { &[][]FlatFnGenItem(a.work_chunks_ptr) }
+	w.gen_fn_chunks_scoped_dynamic(*chunks, a.chunk_queue, a.reserve_cost)
+	return unsafe { nil }
+}
+
+fn (mut g FlatGen) collect_fn_gen_candidates_parallel(direct_array_access_fns DirectArrayAccessFns, ignore_overflow_fns DirectArrayAccessFns, program_modules map[string]bool) []FlatFnGenCandidate {
+	nodes := g.top_level_nodes()
+	if isnil(g.a.worker_pool) || g.a.worker_pool.size() == 0 || nodes.len < 2048 {
+		return g.collect_fn_gen_candidates_range(nodes, 0, nodes.len, '', '', direct_array_access_fns, ignore_overflow_fns, program_modules)
+	}
+	mut n_jobs := g.a.worker_pool.size() + 1
+	if n_jobs > max_flat_cgen_select_jobs {
+		n_jobs = max_flat_cgen_select_jobs
+	}
+	if n_jobs > nodes.len {
+		n_jobs = nodes.len
+	}
+	mut files := []string{len: n_jobs}
+	mut modules := []string{len: n_jobs}
+	mut boundary := 0
+	mut cur_file := ''
+	mut cur_module := ''
+	for pos in 0 .. nodes.len {
+		for boundary < n_jobs && pos == nodes.len * boundary / n_jobs {
+			files[boundary] = cur_file
+			modules[boundary] = cur_module
+			boundary++
+		}
+		node := g.a.nodes[nodes[pos]]
+		if node.kind == .file {
+			cur_file = node.value
+			cur_module = ''
+		} else if node.kind == .module_decl {
+			cur_module = node.value
+		}
+	}
+	mut args := []FlatCgenSelectArgs{cap: n_jobs}
+	for job in 0 .. n_jobs {
+		args << FlatCgenSelectArgs{
+			g:                       voidptr(g)
+			nodes_ptr:               unsafe { voidptr(&nodes) }
+			start:                   nodes.len * job / n_jobs
+			end:                     nodes.len * (job + 1) / n_jobs
+			file:                    files[job]
+			module_name:             modules[job]
+			direct_array_access_fns: direct_array_access_fns
+			ignore_overflow_fns:     ignore_overflow_fns
+			program_modules:         program_modules
+			candidates:              []FlatFnGenCandidate{}
+			scope:                   unsafe { nil }
+		}
+	}
+	mut tasks := []workers.Task{cap: n_jobs}
+	for job in 0 .. n_jobs {
+		tasks << workers.Task{
+			run:        flat_cgen_select_thread
+			arg:        unsafe { voidptr(&args[job]) }
+			force_sync: job == 0
+		}
+	}
+	g.a.worker_pool.run(tasks)
+	// One allocation for the joined list: growing it while appending copied
+	// the candidates several times over.
+	mut n_candidates := 0
+	for i in 0 .. args.len {
+		n_candidates += args[i].candidates.len
+	}
+	mut candidates := []FlatFnGenCandidate{cap: n_candidates}
+	for arg in args {
+		candidates << arg.candidates
+		if arg.scope != unsafe { nil } {
+			g.parallel_worker_scopes << arg.scope
+		}
+	}
+	return candidates
+}
+
+// scan_collect_gen_info partitions the read-only whole-AST sizing scan across
+// the persistent pool. A count pass computes exact output offsets, then a fill
+// pass writes disjoint ranges while preserving AST order.
+fn (mut g FlatGen) scan_collect_gen_info(no_parallel bool) CollectGenInfoScanCounts {
+	if no_parallel || isnil(g.a.worker_pool) || g.a.worker_pool.size() == 0
+		|| g.a.nodes.len < 65_536 || os.getenv('V3_NO_PAR_CGEN_INFO_SCAN') != '' {
+		return g.scan_collect_gen_info_serial()
+	}
+	n_jobs := flat_cgen_job_count(g.a.worker_pool.size() + 1, g.a.nodes.len,
+		g.flat_cgen_job_limit())
+	mut args := []CollectGenInfoScanArgs{cap: n_jobs}
+	mut tasks := []workers.Task{cap: n_jobs}
+	mut metadata_bits := []u64{len: (g.a.nodes.len + 63) / 64}
+	g.shared_scan_bits = []u64{len: (g.a.nodes.len + 63) / 64}
+	parsed_end := g.parsed_node_end()
+	for job in 0 .. n_jobs {
+		// Ranges start on a 64-node boundary, so that no two jobs write the same
+		// word of metadata_bits.
+		start := if job == 0 { 0 } else { (g.a.nodes.len * job / n_jobs) & ~63 }
+		end := if job == n_jobs - 1 {
+			g.a.nodes.len
+		} else {
+			(g.a.nodes.len * (job + 1) / n_jobs) & ~63
+		}
+		args << CollectGenInfoScanArgs{
+			g:                 voidptr(g)
+			start:             start
+			end:               end
+			parsed_end:        parsed_end
+			metadata_bits_ptr: unsafe { voidptr(&metadata_bits) }
+			shared_bits_ptr:   unsafe { voidptr(&g.shared_scan_bits) }
+			type_text_cache:   &TypeMetadataTextCache{}
+		}
+	}
+	for job in 0 .. n_jobs {
+		tasks << workers.Task{
+			run:        collect_gen_info_scan_count_thread
+			arg:        unsafe { voidptr(&args[job]) }
+			force_sync: job == 0
+		}
+	}
+	g.a.worker_pool.run(tasks)
+	for i in 0 .. args.len {
+		for id, _ in args[i].c_struct_refs {
+			g.expr_c_struct_refs[id] = true
+		}
+	}
+	g.expr_c_struct_refs_ready = true
+	mut counts := CollectGenInfoScanCounts{}
+	mut top_level_count := 0
+	mut string_count := 0
+	mut parsed_string_count := 0
+	mut type_metadata_count := 0
+	mut embed_count := 0
+	mut sizeof_count := 0
+	for mut arg in args {
+		counts.fn_count += arg.counts.fn_count
+		counts.struct_count += arg.counts.struct_count
+		counts.global_count += arg.counts.global_count
+		counts.const_count += arg.counts.const_count
+		counts.enum_field_count += arg.counts.enum_field_count
+		counts.interface_count += arg.counts.interface_count
+		counts.import_count += arg.counts.import_count
+		counted_top_levels := arg.top_level_pos
+		counted_strings := arg.string_pos
+		counted_type_metadata := arg.type_metadata_pos
+		counted_embeds := arg.embed_pos
+		counted_sizeofs := arg.sizeof_pos
+		arg.top_level_pos = top_level_count
+		arg.string_pos = string_count
+		arg.type_metadata_pos = type_metadata_count
+		arg.embed_pos = embed_count
+		arg.sizeof_pos = sizeof_count
+		top_level_count += counted_top_levels
+		string_count += counted_strings
+		parsed_string_count += arg.parsed_strings
+		type_metadata_count += counted_type_metadata
+		embed_count += counted_embeds
+		sizeof_count += counted_sizeofs
+	}
+	g.top_level_node_ids = []i32{len: top_level_count}
+	g.ast_string_literals = []string{len: string_count}
+	g.ast_string_literals_parsed = parsed_string_count
+	g.type_metadata_node_ids = []i32{len: type_metadata_count}
+	g.embed_payload_node_ids = []i32{len: embed_count}
+	g.sizeof_offsetof_node_ids = []i32{len: sizeof_count}
+	for mut arg in args {
+		arg.top_levels_ptr = unsafe { voidptr(&g.top_level_node_ids) }
+		arg.strings_ptr = unsafe { voidptr(&g.ast_string_literals) }
+		arg.type_metadata_ptr = unsafe { voidptr(&g.type_metadata_node_ids) }
+		arg.embed_ptr = unsafe { voidptr(&g.embed_payload_node_ids) }
+		arg.sizeof_ptr = unsafe { voidptr(&g.sizeof_offsetof_node_ids) }
+	}
+	tasks.clear()
+	for job in 0 .. n_jobs {
+		tasks << workers.Task{
+			run:        collect_gen_info_scan_fill_thread
+			arg:        unsafe { voidptr(&args[job]) }
+			force_sync: job == 0
+		}
+	}
+	g.a.worker_pool.run(tasks)
+	unsafe { metadata_bits.free() }
+	g.type_metadata_nodes_ready = true
+	g.embed_payload_nodes_ready = true
+	g.sizeof_offsetof_nodes_ready = true
+	g.shared_scan_bits_ready = true
+	return counts
+}
+
+fn (mut g FlatGen) apply_fn_signature_registrations(registration_lists [][]FnSignatureRegistration, node_regs []FnDeclNodeReg) {
+	mut n_registrations := 0
+	for registrations in registration_lists {
+		n_registrations += registrations.len
+	}
+	if n_registrations < 128 || isnil(g.a.worker_pool) || g.a.worker_pool.size() < 4
+		|| os.getenv('V3_NO_PAR_CGEN_SIG_REG') != '' {
+		for group in 0 .. fn_signature_registration_groups {
+			g.apply_fn_signature_registration_groups(registration_lists, group)
+		}
+		for which in 0 .. 3 {
+			g.register_fn_decl_nodes(node_regs, which)
+		}
+		return
+	}
+	// Signature groups and the three fn-decl node maps each fill their own maps.
+	n_tasks := fn_signature_registration_groups + 3
+	mut args := []FnSignatureRegistrationArgs{cap: n_tasks}
+	mut tasks := []workers.Task{cap: n_tasks}
+	for group in 0 .. n_tasks {
+		args << FnSignatureRegistrationArgs{
+			g:                 voidptr(g)
+			registrations_ptr: unsafe { voidptr(&registration_lists) }
+			node_regs_ptr:     unsafe { voidptr(&node_regs) }
+			group:             group
+		}
+	}
+	for group in 0 .. n_tasks {
+		tasks << workers.Task{
+			run:        fn_signature_registration_thread
+			arg:        unsafe { voidptr(&args[group]) }
+			force_sync: group == 0
+		}
+	}
+	g.a.worker_pool.run(tasks)
+}
+
+fn (mut g FlatGen) prepare_shared_sum_and_fixed_array_ret_wrappers(parallel bool) bool {
+	if g.shared_sum_wrappers_ready {
+		// Already built while the pre-dispatch helper lanes finished.
+		return true
+	}
+	mut sw := time.new_stopwatch()
+	if !parallel || os.getenv('V3_NO_PAR_FIXED_RET') != '' {
+		g.collect_shared_type_names()
+		g.precompute_sum_name_lookup()
+		if !g.skip_generics {
+			g.precompute_generic_method_candidate_index()
+		}
+		g.timing_profile('  [ttime]     wr shared+sum  ${f64(sw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+		sw.restart()
+		g.populate_fixed_array_ret_wrappers()
+		g.timing_profile('  [ttime]     wr fixed ret   ${f64(sw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+		return false
+	}
+	mut wrapper_workers, wrapper_threads := g.start_fixed_array_ret_wrappers()
+	g.collect_shared_sum_indexes()
+	if !g.skip_generics {
+		g.precompute_generic_method_candidate_index()
+	}
+	g.timing_profile('  [ttime]     wr shared+sum  ${f64(sw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	sw.restart()
+	g.finish_fixed_array_ret_wrappers(mut wrapper_workers, wrapper_threads)
+	g.timing_profile('  [ttime]     wr fixed ret   ${f64(sw.elapsed().microseconds()) / 1000.0:7.2f} ms (overlapped)')
+	return true
+}
+
+// collect_shared_sum_indexes builds the shared-type and sum-type indexes. Both
+// install fresh maps, so forks taken before keep reading their own copies.
+fn (mut g FlatGen) collect_shared_sum_indexes() {
+	g.collect_shared_type_names()
+	g.precompute_sum_name_lookup()
+}
+
+// start_fixed_array_ret_wrappers runs the fixed-array return wrapper scan and
+// the support precompute on private forks; finish_fixed_array_ret_wrappers
+// joins them and takes over their tables. Both read only collected
+// declaration tables.
+fn (mut g FlatGen) start_fixed_array_ret_wrappers() ([]&FlatGen, []thread voidptr) {
+	mut worker := g.new_parallel_worker(3)
+	worker.fixed_array_ret_wrappers = map[string]bool{}
+	mut support_worker := g.new_parallel_worker(5)
+	// Cleanup precomputation also reads synthetic drops in transformed declarations.
+	support_worker.fn_decl_nodes_by_name = g.fn_decl_nodes_by_name
+	// Both helpers run beside function selection, which writes the master's C-name
+	// and generic-application caches and may release the arena behind them. Keep
+	// their caches private instead of reading the master's through `base`.
+	worker.c_name_cache = &CNameCache{}
+	worker.generic_app_cache = &GenericAppCache{}
+	support_worker.c_name_cache = &CNameCache{}
+	support_worker.generic_app_cache = &GenericAppCache{}
+	support_worker.recursive_drop_helpers = map[u64]u32{}
+	support_worker.fixed_array_map_key_types = map[string]types.ArrayFixed{}
+	mut threads := []thread voidptr{cap: 2}
+	threads << spawn fixed_array_ret_wrappers_thread(voidptr(worker))
+	threads << spawn cgen_support_precompute_thread(voidptr(support_worker))
+	return [worker, support_worker], threads
+}
+
+fn (mut g FlatGen) finish_fixed_array_ret_wrappers(mut wrapper_workers []&FlatGen, threads []thread voidptr) {
+	for t in threads {
+		_ = t.wait()
+	}
+	mut worker := wrapper_workers[0]
+	mut support_worker := wrapper_workers[1]
+	g.fixed_array_ret_wrappers = worker.fixed_array_ret_wrappers.move()
+	g.recursive_drop_helpers = support_worker.recursive_drop_helpers.move()
+	g.fixed_array_map_key_types = support_worker.fixed_array_map_key_types.move()
+	if worker.worker_scope != unsafe { nil } {
+		g.parallel_worker_scopes << worker.worker_scope
+		worker.worker_scope = unsafe { nil }
+	}
+	if support_worker.worker_scope != unsafe { nil } {
+		g.parallel_worker_scopes << support_worker.worker_scope
+		support_worker.worker_scope = unsafe { nil }
+	}
+	g.shared_sum_wrappers_ready = true
+}
+
+// collect_gen_info_fn_preps resolves used function signatures on the persistent
+// worker pool. Registration stays serial in collect_gen_info, preserving all
+// source-order and duplicate-declaration semantics.
+fn (mut g FlatGen) collect_gen_info_fn_preps(node_ids []i32, no_parallel bool, with_registrations bool) CollectGenFnPreps {
+	if no_parallel || isnil(g.a.worker_pool) || g.a.worker_pool.size() == 0
+		|| node_ids.len < 2048 || os.getenv('V3_NO_PAR_CGEN_INFO_FNS') != '' {
+		return CollectGenFnPreps{}
+	}
+	n_jobs := flat_cgen_job_count(g.a.worker_pool.size() + 1, node_ids.len,
+		g.flat_cgen_job_limit())
+	mut context_files := []string{len: n_jobs}
+	mut context_modules := []string{len: n_jobs}
+	mut cur_file := ''
+	mut cur_module := 'main'
+	mut boundary := 0
+	for pos in 0 .. node_ids.len {
+		for boundary < n_jobs && pos == node_ids.len * boundary / n_jobs {
+			context_files[boundary] = cur_file
+			context_modules[boundary] = cur_module
+			boundary++
+		}
+		node := g.a.nodes[node_ids[pos]]
+		if node.kind == .file {
+			cur_file = node.value
+			cur_module = 'main'
+		} else if node.kind == .module_decl {
+			cur_module = node.value
+		}
+	}
+	for boundary < n_jobs {
+		context_files[boundary] = cur_file
+		context_modules[boundary] = cur_module
+		boundary++
+	}
+	mut args := []CollectGenInfoFnPrepArgs{cap: n_jobs}
+	mut tasks := []workers.Task{cap: n_jobs}
+	for job in 0 .. n_jobs {
+		args << CollectGenInfoFnPrepArgs{
+			g:             voidptr(g)
+			node_ids_ptr:  unsafe { voidptr(&node_ids) }
+			start:         node_ids.len * job / n_jobs
+			end:           node_ids.len * (job + 1) / n_jobs
+			file:          context_files[job]
+			module_name:   context_modules[job]
+			registrations: with_registrations
+		}
+	}
+	for job in 0 .. n_jobs {
+		tasks << workers.Task{
+			run:        collect_gen_info_fn_prep_thread
+			arg:        unsafe { voidptr(&args[job]) }
+			force_sync: job == 0
+		}
+	}
+	g.a.worker_pool.run(tasks)
+	mut preps := CollectGenFnPreps{
+		ready: true
+		jobs:  []CollectGenFnPrepJob{cap: n_jobs}
+	}
+	for i in 0 .. args.len {
+		preps.jobs << CollectGenFnPrepJob{
+			end:           args[i].end
+			positions:     moved_fn_prep_positions(args[i].positions)
+			preps:         moved_fn_preps(args[i].preps)
+			registrations: moved_fn_signature_registrations(args[i].signature_regs)
+		}
+	}
+	return preps
+}
+
+// moved_fn_prep_positions and moved_fn_preps return their argument: a call
+// result is stored without the deep copy of an addressable array.
+@[inline]
+fn moved_fn_prep_positions(positions []i32) []i32 {
+	return positions
+}
+
+@[inline]
+fn moved_fn_preps(preps []CollectGenFnPrep) []CollectGenFnPrep {
+	return preps
+}
+
+// finish_pending_item_prep_serial is the fallback for the work item selection
+// defers to the parallel exact-cost pass (C-extern refs, and in parallel-prep
+// mode also costs and fn-ptr preseeds): when that pass cannot run, do the
+// deferred work serially like the former fused prep walk did.
+fn (mut g FlatGen) finish_pending_item_prep_serial() {
+	if !g.prep_externs_pending && !g.prep_costs_pending {
+		return
+	}
+	mut stack := []flat.NodeId{cap: 256}
+	if g.prep_costs_pending {
+		g.prep_costs_pending = false
+		// The selection-scope-allocated caches are gone by now; walk with
+		// fresh ones.
+		g.prep_typ_text_cache = &PrepTypTextCache{}
+		g.preseed_type_seen = &PreseedTypeSeen{}
+		mut type_text_cache := map[u32]bool{}
+		for i in 0 .. g.fn_gen_items.len {
+			item := g.fn_gen_items[i]
+			if item.file != g.tc.cur_file || item.module != g.tc.cur_module {
+				type_text_cache.clear()
+				if !isnil(g.prep_typ_text_cache) {
+					g.prep_typ_text_cache.generation++
+				}
+			}
+			g.tc.cur_file = item.file
+			g.tc.cur_module = item.module
+			g.fn_gen_items[i].cost = g.fn_item_cost_and_prep(item.node_id, mut stack, mut type_text_cache)
+		}
+	}
+	if g.prep_externs_pending {
+		g.prep_externs_pending = false
+		items := g.fn_gen_items
+		for item in items {
+			_ = g.fn_item_cost_and_c_extern_prep(item.node_id, mut stack)
+		}
+	}
+}
+
+fn (mut g FlatGen) refine_fn_item_costs(no_parallel bool, reserve_worker bool) {
+	if no_parallel || g.fn_gen_items.len < min_flat_cgen_parallel_items {
+		g.finish_pending_item_prep_serial()
+		return
+	}
+	if isnil(g.a.worker_pool) || g.a.worker_pool.size() == 0 {
+		g.finish_pending_item_prep_serial()
+		return
+	}
+	available_jobs := g.a.worker_pool.size() + 1 - if reserve_worker { 1 } else { 0 }
+	n_jobs := flat_cgen_job_count(available_jobs, g.fn_gen_items.len, g.flat_cgen_job_limit())
+	fused := g.prep_costs_pending
+	mut prep_g := unsafe { nil }
+	if fused {
+		if g.prep_alias_short_names.len == 0 {
+			for registry_name_id, _ in g.tc.type_aliases.ids {
+				g.prep_alias_short_names[flat.source_type_syntax(registry_name_id).unqualified()] = true
+			}
+		}
+		prep_g = voidptr(g)
+	}
+	mut args := []FlatCgenCostArgs{cap: n_jobs}
+	mut tasks := []workers.Task{cap: n_jobs}
+	mut boundaries := []int{len: n_jobs + 1, init: g.fn_gen_items.len}
+	boundaries[0] = 0
+	if os.getenv('V3_NO_CGEN_COST_BALANCE') == '' {
+		mut total_cost := i64(g.fn_gen_items.len)
+		for item in g.fn_gen_items {
+			total_cost += i64(item.cost)
+		}
+		mut consumed_cost := i64(0)
+		mut pos := 0
+		for job in 1 .. n_jobs {
+			target_cost := total_cost * i64(job) / i64(n_jobs)
+			max_pos := g.fn_gen_items.len - (n_jobs - job)
+			for pos < max_pos && (consumed_cost < target_cost || pos == boundaries[job - 1]) {
+				consumed_cost += i64(g.fn_gen_items[pos].cost) + 1
+				pos++
+			}
+			boundaries[job] = pos
+		}
+	} else {
+		for job in 1 .. n_jobs {
+			boundaries[job] = g.fn_gen_items.len * job / n_jobs
+		}
+	}
+	for job in 0 .. n_jobs {
+		args << FlatCgenCostArgs{
+			a:         unsafe { g.a }
+			items_ptr: unsafe { voidptr(&g.fn_gen_items) }
+			start:     boundaries[job]
+			end:       boundaries[job + 1]
+			g:         prep_g
+			windows:   g.target.os == 'windows'
+		}
+	}
+	for job in 0 .. n_jobs {
+		tasks << workers.Task{
+			run:        flat_cgen_cost_thread
+			arg:        unsafe { voidptr(&args[job]) }
+			force_sync: job == 0
+		}
+	}
+	rfsw := time.new_stopwatch()
+	g.a.worker_pool.run(tasks)
+	g.timing_profile('  [ttime]     cg refine pool ${f64(rfsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	for arg in args {
+		for name, used in arg.refs {
+			if used {
+				g.c_extern_refs[name] = true
+			}
+		}
+	}
+	if fused {
+		rpsw := time.new_stopwatch()
+		mut n_cands := 0
+		for arg in args {
+			n_cands += arg.cands.len
+		}
+		g.replay_prep_candidates(args)
+		g.timing_profile('  [ttime]     cg replay      ${f64(rpsw.elapsed().microseconds()) / 1000.0:7.2f} ms (cands: ${n_cands})')
+		g.prep_costs_pending = false
+	}
+	g.prep_externs_pending = false
+	for arg in args {
+		cgen_worker_scope_free(arg.scope)
+	}
+}
+
+// replay_prep_candidates applies the fn-ptr preseeds collected by the parallel
+// prep workers, in source order, so registrations land exactly as the former
+// serial walk produced them.
+fn (mut g FlatGen) replay_prep_candidates(args []FlatCgenCostArgs) {
+	mut type_text_cache := map[u32]bool{}
+	// Fresh local dedup cache: g.preseed_type_seen was allocated inside the
+	// (already freed) selection scope and must not be touched here.
+	mut replay_seen := &PreseedTypeSeen{}
+	for arg in args {
+		for cand in arg.cands {
+			item := g.fn_gen_items[cand.item_idx]
+			if item.file != g.tc.cur_file || item.module != g.tc.cur_module {
+				type_text_cache.clear()
+				g.tc.cur_file = item.file
+				g.tc.cur_module = item.module
+			}
+			if cand.is_expr {
+				if replay_seen.insert(cand.typ) {
+					g.preseed_parallel_fn_ptr_type(cand.typ)
+				}
+			} else {
+				if g.should_preseed_parallel_type_id_cached(cand.text, mut type_text_cache) {
+					g.preseed_parallel_fn_ptr_type(g.tc.parse_type(cand.text))
+				}
+			}
+		}
+	}
+}
+
+// preintern_ast_string_literals numbers every AST string literal before any
+// function body is generated: literals of parsed nodes in AST order, then the
+// values that only synthesized nodes carry, see intern_synthesized_string_literals.
+@[direct_array_access]
+fn (mut g FlatGen) preintern_ast_string_literals() {
+	if g.ast_string_literals_ready {
+		parsed := int_min(g.ast_string_literals_parsed, g.ast_string_literals.len)
+		for i in 0 .. parsed {
+			g.intern_string(g.ast_string_literals[i])
+		}
+		g.intern_synthesized_string_literals(g.ast_string_literals[parsed..])
+		return
+	}
+	parsed_end := g.parsed_node_end()
+	mut synthesized := []string{}
+	for i in 0 .. g.a.nodes.len {
+		node := unsafe { &g.a.nodes[i] }
+		if node.kind == .string_literal && !node.is_embed_payload() {
+			if i < parsed_end {
+				g.intern_string(node.value)
+			} else {
+				synthesized << node.value
+			}
+		}
+	}
+	g.intern_synthesized_string_literals(synthesized)
+}
+
+// intern_synthesized_string_literals numbers the literal values that only
+// synthesized nodes carry in sorted order. Those nodes are appended in an order
+// that depends on how the checker and transform split their work across
+// threads, so AST order would make the generated C depend on the job count.
+fn (mut g FlatGen) intern_synthesized_string_literals(values []string) {
+	mut fresh := []string{}
+	for value in values {
+		if value !in g.str_lit_ids {
+			fresh << value
+		}
+	}
+	fresh.sort()
+	for value in fresh {
+		g.intern_string(value)
+	}
+}
+
+fn (mut g FlatGen) prepare_pre_dispatch_master() {
+	mut n_items := 0
+	if g.scope_parallel_workers {
+		mut pmsw := time.new_stopwatch()
+		selection_scope := cgen_worker_scope_begin(true)
+		retain_selection := g.tc.building_v_fast
+			|| os.getenv('V3_RETAIN_CGEN_PREP_SCOPE') != ''
+		master_tc := g.tc
+		g.tc = g.clone_parallel_type_checker()
+		g.tc.verbose = master_tc.verbose
+		g.timing_profile('  [ttime]       pm clone tc  ${f64(pmsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+		pmsw.restart()
+		// Fuse body-local function-pointer discovery into the item cost walk so
+		// parallel type declarations see every typedef before their task starts.
+		// The globally numbered string table must also be complete before output.
+		if !g.ast_string_literals_interned {
+			g.preintern_ast_string_literals()
+		}
+		g.timing_profile('  [ttime]       pm str walk  ${f64(pmsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+		pmsw.restart()
+		g.want_parallel_prep = true
+		items := g.ensure_fn_gen_items()
+		g.want_parallel_prep = false
+		g.timing_profile('  [ttime]       pm items     ${f64(pmsw.elapsed().microseconds()) / 1000.0:7.2f} ms (n: ${items.len})')
+		pmsw.restart()
+		if _ := g.ierror_interface_name() {
+			g.intern_string('')
+		}
+		g.register_interface_strings()
+		g.tc = master_tc
+		cgen_worker_scope_leave(selection_scope)
+		if g.parallel_worker_scopes.len > 0 {
+			// Candidate collection records helper scopes while selection_scope is
+			// current. The list must outlive every arena it names, including a
+			// retained selection_scope freed partway through final cgen cleanup.
+			g.parallel_worker_scopes = g.parallel_worker_scopes.clone()
+		}
+		if retain_selection {
+			// The selected items and predispatch tables are immutable from here on.
+			// Keep their arena through final output so they can move straight into
+			// cgen instead of cloning every item, string table, and lookup map only
+			// to free the originals immediately afterward.
+			g.parallel_worker_scopes << selection_scope
+			g.timing_profile('  [ttime]       pm retain out ${f64(pmsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+			n_items = items.len
+		} else {
+			items_scope := cgen_worker_scope_begin(true)
+			mut owned_items := []FlatFnGenItem{cap: items.len}
+			for item in items {
+				owned_items << FlatFnGenItem{
+					node_id:                   item.node_id
+					file:                      item.file
+					module:                    item.module
+					c_name:                    item.c_name.clone()
+					cost:                      item.cost
+					is_program_specialization: item.is_program_specialization
+					is_program:                item.is_program
+					direct_array_access:       item.direct_array_access
+					ignore_overflow:           item.ignore_overflow
+				}
+			}
+			g.fn_gen_items = owned_items
+			cgen_worker_scope_leave(items_scope)
+			g.scoped_fn_items_scope = items_scope
+			// These tables remain live after release_scoped_fn_items, so promote them
+			// into the enclosing cgen arena rather than the retained item arena.
+			g.str_lits = clone_cgen_string_list(g.str_lits)
+			g.str_lit_ids = clone_cgen_string_int_map(g.str_lit_ids)
+			g.specialized_method_c_names = clone_cgen_string_map(g.specialized_method_c_names)
+			g.fn_ptr_types = clone_cgen_string_map(g.fn_ptr_types)
+			g.used_fn_ptr_types = clone_cgen_string_bool_map(g.used_fn_ptr_types)
+			g.c_extern_refs = clone_cgen_string_bool_map(g.c_extern_refs)
+			g.c_name_cache = clone_c_name_cache(g.c_name_cache)
+			g.generic_app_cache = clone_generic_app_cache(g.generic_app_cache)
+			// Import resolutions can borrow text and Type payloads from selection.
+			// Discard that memo before its scratch storage is released.
+			g.import_type_cache = &ImportTypeCache{}
+			cgen_worker_scope_free(selection_scope)
+			n_items = g.fn_gen_items.len
+			g.timing_profile('  [ttime]       pm clone out ${f64(pmsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+		}
+	} else {
+		g.want_parallel_prep = true
+		n_items = g.ensure_fn_gen_items().len
+		g.want_parallel_prep = false
+	}
+	if n_items >= min_flat_cgen_parallel_items {
+		// The fused item walk already interned and pre-seeded; only the
+		// epilogue remains.
+		if !g.scope_parallel_workers {
+			if _ := g.ierror_interface_name() {
+				g.intern_string('')
+			}
+			g.register_interface_strings()
+		}
+		if g.test_files.len == 0 && !g.has_entry_main() {
+			for stmt in g.top_level_stmts() {
+				g.collect_c_extern_referenced_symbols_from_node(stmt.id, mut g.c_extern_refs)
+			}
+		}
+		g.parallel_prepared = true
+	}
+	// Force the lazily-built const short-name index now: workers share it
+	// read-only, so it must be complete before any fork starts.
+	_ = g.unique_const_ref_name('__v3_prewarm__') or { '' }
+}
+
+fn clone_array_method_receiver_cache(values map[u64]map[string]string) map[u64]map[string]string {
+	mut cloned := map[u64]map[string]string{}
+	for key, methods in values {
+		cloned[key] = methods.clone()
+	}
+	return cloned
+}
+
+fn clone_cgen_string_map(values map[string]string) map[string]string {
+	mut cloned := map[string]string{}
+	for key, value in values {
+		cloned[key.clone()] = value.clone()
+	}
+	return cloned
+}
+
+fn clone_cgen_string_bool_map(values map[string]bool) map[string]bool {
+	mut cloned := map[string]bool{}
+	for key, value in values {
+		cloned[key.clone()] = value
+	}
+	return cloned
+}
+
+fn clone_cgen_string_int_map(values map[string]int) map[string]int {
+	mut cloned := map[string]int{}
+	for key, value in values {
+		cloned[key.clone()] = value
+	}
+	return cloned
+}
+
+fn clone_c_name_cache(source &CNameCache) &CNameCache {
+	mut entries := map[string]string{}
+	if !isnil(source) {
+		for key, value in source.entries {
+			entries[key.clone()] = value.clone()
+		}
+	}
+	return &CNameCache{
+		entries: entries
+	}
+}
+
+fn clone_generic_app_cache(source &GenericAppCache) &GenericAppCache {
+	mut entries := map[u32]GenericAppInfo{}
+	if !isnil(source) {
+		for key, value in source.entries {
+			entries[key] = GenericAppInfo{
+				base: value.base
+				args: value.args.clone()
+				ok:   value.ok
+			}
+		}
+	}
+	return &GenericAppCache{
+		entries: entries
+	}
+}
+
+// write_scoped_cgen_batch_output writes a batch builder while its disposable
+// scope is still active, avoiding a second output copy in the parent arena.
+fn (mut g FlatGen) write_scoped_cgen_batch_output(batch &FlatGen) bool {
+	mut file := os.open_append(g.scoped_fn_output_path) or {
+		g.output_error = err.msg()
+		return false
+	}
+	if batch.cache_stable_symbols {
+		mut b := unsafe { batch }
+		source := b.sb.str()
+		stable_source := b.rewrite_cache_string_symbols(source)
+		file.write_string(stable_source) or {
+			g.output_error = err.msg()
+			file.close()
+			unsafe {
+				source.free()
+				stable_source.free()
+			}
+			return false
+		}
+		unsafe {
+			source.free()
+			stable_source.free()
+		}
+	} else {
+		unsafe {
+			file.write_full_buffer(batch.sb.data, uint(batch.sb.len)) or {
+				g.output_error = err.msg()
+				file.close()
+				return false
+			}
+		}
+	}
+	file.close()
+	return true
+}
+
+// cgen_publish_builder_text copies a helper builder's text into the arena that
+// encloses `scope` and releases the builder's scoped storage.
+fn cgen_publish_builder_text(mut sb strings.Builder, scope voidptr) string {
+	$if prealloc {
+		if scope != unsafe { nil } {
+			state := unsafe { prealloc_scope_suspend(scope) }
+			text := sb.str()
+			unsafe { prealloc_scope_resume(scope, state) }
+			unsafe { sb.free() }
+			return text
+		}
+	}
+	text := sb.str()
+	unsafe { sb.free() }
+	return text
+}
+
+// cgen_take_builder_text returns the text accumulated in `sb` as a string the
+// caller owns; under -prealloc it hands the builder's storage over instead of
+// copying it, so `sb` must be replaced before it is written again.
+fn cgen_take_builder_text(mut sb strings.Builder) string {
+	if sb.len == 0 {
+		unsafe { sb.free() }
+		sb = strings.new_builder(0)
+		return ''
+	}
+	$if !prealloc {
+		// An array's storage starts past a header in its allocation, so
+		// string.free could not release text pointing into it; copy the text.
+		text := sb.str()
+		unsafe { sb.free() }
+		sb = strings.new_builder(0)
+		return text
+	}
+	// The arena releases the storage, and string.free does not free under it.
+	sb << u8(0)
+	output := unsafe { sb.reuse_as_plain_u8_array() }
+	return unsafe { tos(&u8(output.data), output.len - 1) }
+}
+
+// moved_segment returns its argument unchanged. Appending an addressable
+// string (a local or field) to an array clones its bytes; passing the value
+// through a call appends the existing storage instead. Output segments are
+// already private copies, so the clone would only double their footprint.
+@[inline]
+fn moved_segment(s string) string {
+	return s
+}
+
+// absorb_scoped_cgen_batch copies a finished batch's observable side tables
+// and, when needed, output into the helper's result arena.
+fn (mut g FlatGen) absorb_scoped_cgen_batch(batch &FlatGen, output_streamed bool) {
+	mut b := unsafe { batch }
+	string_id_remap := g.publish_worker_string_literals(batch)
+	user_c_symbols := if string_id_remap.len > 0 {
+		g.cache_user_c_string_symbols()
+	} else {
+		map[string]bool{}
+	}
+	if batch.callback_identity_used {
+		g.callback_identity_used = true
+	}
+	if batch.windows_entry_point_generated {
+		g.windows_entry_point_generated = true
+		g.windows_gui_entry_point = batch.windows_gui_entry_point
+	}
+	if !output_streamed && b.sb.len > 0 {
+		// Append the builder's copy directly: appending an addressable local
+		// would clone the whole chunk output a second time into this arena.
+		batch_output := b.sb.str()
+		if batch.cache_stable_symbols {
+			g.fn_segs << b.rewrite_cache_string_symbols(batch_output)
+			unsafe { batch_output.free() }
+		} else if string_id_remap.len > 0 {
+			g.fn_segs << remap_scoped_worker_string_symbols(batch_output, string_id_remap,
+				user_c_symbols)
+			unsafe { batch_output.free() }
+		} else {
+			g.fn_segs << moved_segment(batch_output)
+		}
+	}
+	unsafe { b.sb.free() }
+	// A batch starts from a copy of these tables and only adds to them, so a
+	// table of unchanged size holds nothing new.
+	if batch.needed_optional_types.ids.len != g.needed_optional_types.ids.len {
+		for opt_name, val_type_id in batch.needed_optional_types.ids {
+			if !g.needed_optional_types.contains(opt_name) {
+				g.needed_optional_types.set_id(opt_name.clone(), val_type_id)
+			}
+		}
+	}
+	if batch.optional_pointer_struct_tags.len != g.optional_pointer_struct_tags.len {
+		for opt_name, val_type in batch.optional_pointer_struct_tags {
+			if opt_name !in g.optional_pointer_struct_tags {
+				g.optional_pointer_struct_tags[opt_name.clone()] = val_type.clone()
+			}
+		}
+	}
+	if batch.fn_ptr_types.len != g.fn_ptr_types.len {
+		for encoded, name in batch.fn_ptr_types {
+			if encoded !in g.fn_ptr_types {
+				g.fn_ptr_types[encoded.clone()] = name.clone()
+			}
+		}
+	}
+	// Batches of one dispatcher keep reporting the same names; copy a key only
+	// when it is new, so repeats do not pile up in the result arena.
+	for encoded, used in batch.used_fn_ptr_types {
+		if used && !g.used_fn_ptr_types[encoded] {
+			g.used_fn_ptr_types[encoded.clone()] = true
+		}
+	}
+	if !batch.c_extern_refs_shared {
+		for name, used in batch.c_extern_refs {
+			if used && !g.c_extern_refs[name] {
+				g.c_extern_refs[name.clone()] = true
+			}
+		}
+	}
+	if batch.needs_thread_runtime {
+		g.needs_thread_runtime = true
+	}
+	if batch.needs_pthread_header {
+		g.needs_pthread_header = true
+	}
+	if batch.needs_thread_type {
+		g.needs_thread_type = true
+	}
+	for name, enabled in batch.libc_compat_fns {
+		if enabled && !g.libc_compat_fns[name] {
+			g.libc_compat_fns[name.clone()] = true
+		}
+	}
+	for key, name in batch.spawn_wrapper_names {
+		if key !in g.spawn_wrapper_names {
+			g.spawn_wrapper_names[key.clone()] = name.clone()
+		}
+	}
+	for def in batch.spawn_wrapper_defs {
+		if batch.cache_stable_symbols {
+			stable_def := b.rewrite_cache_string_symbols(def)
+			g.add_spawn_wrapper_def(stable_def)
+		} else if string_id_remap.len > 0 {
+			g.add_spawn_wrapper_def(remap_scoped_worker_string_symbols(def, string_id_remap,
+				user_c_symbols))
+		} else {
+			g.add_spawn_wrapper_def(def.clone())
+		}
+	}
+	for key, name in batch.callback_wrapper_names {
+		if key !in g.callback_wrapper_names {
+			g.callback_wrapper_names[key.clone()] = name.clone()
+		}
+	}
+	for def in batch.callback_wrapper_defs {
+		if batch.cache_stable_symbols {
+			stable_def := b.rewrite_cache_string_symbols(def)
+			g.add_callback_wrapper_def(stable_def)
+		} else if string_id_remap.len > 0 {
+			g.add_callback_wrapper_def(remap_scoped_worker_string_symbols(def, string_id_remap,
+				user_c_symbols))
+		} else {
+			g.add_callback_wrapper_def(def.clone())
+		}
+	}
+	for wrappers in batch.parallel_chunk_wrapper_defs {
+		spawn_defs := if string_id_remap.len > 0 {
+			remap_scoped_worker_string_list(wrappers.spawn, string_id_remap, user_c_symbols)
+		} else {
+			clone_cgen_string_list(wrappers.spawn)
+		}
+		callback_defs := if string_id_remap.len > 0 {
+			remap_scoped_worker_string_list(wrappers.callback, string_id_remap, user_c_symbols)
+		} else {
+			clone_cgen_string_list(wrappers.callback)
+		}
+		g.parallel_chunk_wrapper_defs << ParallelChunkWrapperDefs{
+			chunk_idx: wrappers.chunk_idx
+			spawn:     spawn_defs
+			callback:  callback_defs
+		}
+	}
+}
+
+fn remap_scoped_worker_string_list(source []string, remap map[int]int, user_c_symbols map[string]bool) []string {
+	mut result := []string{cap: source.len}
+	for item in source {
+		result << remap_scoped_worker_string_symbols(item, remap, user_c_symbols)
+	}
+	return result
+}
+
+// scoped_cgen_batch_count amortizes worker setup across small function bodies.
+// Compiler builds keep their narrower batches to bound retained lowering scratch.
+fn (g &FlatGen) scoped_cgen_batch_count(n_items int, total_cost i64) int {
+	if n_items == 0 {
+		return 0
+	}
+	mut count := int_min(n_items, scoped_cgen_worker_batches)
+	if !g.tc.building_v_fast {
+		by_cost := total_cost / min_scoped_cgen_batch_cost
+		if by_cost < i64(count) {
+			count = int(by_cost)
+		}
+	}
+	return int_max(count, 1)
+}
+
+// gen_fn_items_scoped_batches bounds helper scratch without adding worker-pool
+// barriers. Each batch gets fresh mutable generator/checker caches while its C
+// output is accumulated in a much smaller result arena.
+fn (mut g FlatGen) gen_fn_items_scoped_batches(items []FlatFnGenItem) {
+	result_scope := cgen_worker_scope_begin(true)
+	mut total_cost := i64(items.len)
+	for item in items {
+		total_cost += item.cost
+	}
+	n_batches := g.scoped_cgen_batch_count(items.len, total_cost)
+	mut start := 0
+	mut consumed_cost := i64(0)
+	for batch_idx in 0 .. n_batches {
+		mut end := start
+		batch_start_cost := consumed_cost
+		target_cost := total_cost * i64(batch_idx + 1) / i64(n_batches)
+		for end < items.len
+			&& (batch_idx == n_batches - 1 || consumed_cost < target_cost || end == start) {
+			consumed_cost += i64(items[end].cost) + 1
+			end++
+		}
+		scratch_scope := cgen_worker_scope_begin(true)
+		mut batch := g.new_parallel_worker(batch_idx)
+		// Weighted AST cost tracks generated body bytes closely enough to avoid
+		// the 64 KiB builder growing and copying five or six times per worker.
+		batch.sb = strings.new_builder(int((consumed_cost - batch_start_cost) * 5) + 65_536)
+		batch.gen_fn_items(items[start..end])
+		cgen_worker_scope_leave(scratch_scope)
+		g.absorb_scoped_cgen_batch(batch, false)
+		cgen_worker_scope_free(scratch_scope)
+		start = end
+	}
+	g.worker_scope = result_scope
+	cgen_worker_scope_leave(result_scope)
+}
+
+fn (mut g FlatGen) gen_fn_chunks_scoped_dynamic(
+	chunks [][]FlatFnGenItem,
+	chunk_queue chan int,
+	_reserve_cost i64) {
+	wsw := time.new_stopwatch()
+	mut n_chunks := 0
+	result_scope := cgen_worker_scope_begin(true)
+	// Chunks assigned to one dispatcher run sequentially. Keep the dense
+	// generation-tagged expression-type memo in the result arena so each scratch
+	// chunk does not allocate and zero another 192 KiB table.
+	reuse_expr_type_memo := os.getenv('V3_NO_REUSE_CGEN_EXPR_TYPE_MEMO') == ''
+	if reuse_expr_type_memo {
+		g.begin_usable_expr_type_memo()
+		g.end_usable_expr_type_memo()
+	}
+	// Chunks reuse one scratch arena: each chunk's output is absorbed into the
+	// result arena before the next chunk starts, so the arena is rewound instead
+	// of being freed and faulted in again for every chunk.
+	mut scratch_scope := unsafe { nil }
+	for {
+		chunk_idx := <-chunk_queue or { break }
+		n_chunks++
+		mut chunk_cost := i64(chunks[chunk_idx].len)
+		for item in chunks[chunk_idx] {
+			chunk_cost += item.cost
+		}
+		if scratch_scope == unsafe { nil }
+			|| !cgen_worker_scope_reenter(scratch_scope, cgen_chunk_arena_keep_bytes) {
+			cgen_worker_scope_free(scratch_scope)
+			scratch_scope = cgen_worker_scope_begin(true)
+		}
+		mut batch := g.new_parallel_worker(chunk_idx)
+		if reuse_expr_type_memo {
+			batch.usable_expr_type_memo = g.usable_expr_type_memo
+		}
+		batch.sb = strings.new_builder(int(chunk_cost * 5) + 65_536)
+		batch.parallel_chunk_wrapper_defs << ParallelChunkWrapperDefs{
+			chunk_idx: chunk_idx
+		}
+		batch.parallel_chunk_wrapper_capture = batch.parallel_chunk_wrapper_defs.len - 1
+		batch.gen_fn_items(chunks[chunk_idx])
+		batch.parallel_chunk_wrapper_capture = -1
+		cgen_worker_scope_leave(scratch_scope)
+		g.absorb_dispatch_chunk(batch, chunk_idx)
+	}
+	cgen_worker_scope_free(scratch_scope)
+	g.timing_profile('  [ttime]     cg wkr busy    ${f64(wsw.elapsed().microseconds()) / 1000.0:7.2f} ms (chunks: ${n_chunks})')
+	g.worker_scope = result_scope
+	cgen_worker_scope_leave(result_scope)
+}
+
+// absorb_dispatch_chunk publishes a finished chunk batch into this body
+// dispatcher, remembering the chunk of its output and of each new literal.
+fn (mut g FlatGen) absorb_dispatch_chunk(batch &FlatGen, chunk_idx int) {
+	segment_start := g.fn_segs.len
+	g.absorb_scoped_cgen_batch(batch, false)
+	if g.fn_segs.len > segment_start {
+		g.fn_seg_chunk_indexes << chunk_idx
+	}
+	for g.str_lit_chunk_indexes.len < g.str_lits.len - g.str_lits_base_len {
+		g.str_lit_chunk_indexes << chunk_idx
+	}
+}
+
+// gen_fn_items_scoped_master_batches publishes each caller-thread batch
+// directly into the already-scoped master generator, so its temporary caches
+// do not remain resident for the rest of cgen.
+fn (mut g FlatGen) gen_fn_items_scoped_master_batches(items []FlatFnGenItem) {
+	mut total_cost := i64(items.len)
+	for item in items {
+		total_cost += item.cost
+	}
+	n_batches := g.scoped_cgen_batch_count(items.len, total_cost)
+	mut start := 0
+	mut consumed_cost := i64(0)
+	// Batches are cost-balanced and each one is absorbed before the next starts,
+	// so one scratch arena is rewound and reused whole instead of being unmapped
+	// and faulted in again for every batch.
+	mut scratch_scope := unsafe { nil }
+	for batch_idx in 0 .. n_batches {
+		mut end := start
+		target_cost := total_cost * i64(batch_idx + 1) / i64(n_batches)
+		for end < items.len
+			&& (batch_idx == n_batches - 1 || consumed_cost < target_cost || end == start) {
+			consumed_cost += i64(items[end].cost) + 1
+			end++
+		}
+		if scratch_scope == unsafe { nil } || !cgen_worker_scope_reenter(scratch_scope, max_int) {
+			cgen_worker_scope_free(scratch_scope)
+			scratch_scope = cgen_worker_scope_begin(true)
+		}
+		mut batch := g.new_parallel_worker(batch_idx)
+		batch.gen_fn_items(items[start..end])
+		cgen_worker_scope_leave(scratch_scope)
+		g.absorb_scoped_cgen_batch(batch, false)
+		start = end
+	}
+	cgen_worker_scope_free(scratch_scope)
+}
+
+fn clone_embedded_fields_by_type(values map[u32][]types.StructField) map[u32][]types.StructField {
+	mut cloned := map[u32][]types.StructField{}
+	for name, fields in values {
+		mut owned_fields := []types.StructField{cap: fields.len}
+		for field in fields {
+			owned_fields << types.StructField{
+				name:        field.name.clone()
+				typ:         types.clone_owned_type(field.typ)
+				has_default: field.has_default
+				is_embed:    field.is_embed
+				is_mut:      field.is_mut
+				is_volatile: field.is_volatile
+			}
+		}
+		cloned[name] = owned_fields
+	}
+	return cloned
+}
+
+fn (mut g FlatGen) publish_fixed_storage_scan(mut fs_worker FlatGen) {
+	for opt_name, val_type_id in fs_worker.needed_optional_types.ids {
+		g.needed_optional_types.set_id(opt_name.clone(), val_type_id)
+	}
+	for opt_name, val_type in fs_worker.optional_pointer_struct_tags {
+		g.optional_pointer_struct_tags[opt_name.clone()] = val_type.clone()
+	}
+	if fs_worker.worker_scope != unsafe { nil } {
+		// The whole-AST scan leaves far more scratch behind than its result
+		// tables hold. Publish owned copies into the enclosing cgen arena and
+		// release the helper arena before the function workers start, instead of
+		// keeping it resident through emission.
+		g.fixed_storage_consts = clone_cgen_string_bool_map(fs_worker.fixed_storage_consts)
+		g.concrete_optional_abi_fns = clone_cgen_string_bool_map(fs_worker.concrete_optional_abi_fns)
+		cgen_worker_scope_free(fs_worker.worker_scope)
+		fs_worker.worker_scope = unsafe { nil }
+		return
+	}
+	g.fixed_storage_consts = fs_worker.fixed_storage_consts.move()
+	g.concrete_optional_abi_fns = fs_worker.concrete_optional_abi_fns.move()
+}
+
+fn clone_shared_alias_pointer_cache(values map[u32]map[string][]types.Type) map[u32]map[string][]types.Type {
+	mut result := map[u32]map[string][]types.Type{}
+	for source_id, entries in values {
+		result[source_id] = clone_cgen_param_types_map(entries)
+	}
+	return result
+}
+
+fn clone_cgen_param_types_map(values map[string][]types.Type) map[string][]types.Type {
+	mut cloned := map[string][]types.Type{}
+	for key, params in values {
+		cloned[key.clone()] = types.clone_owned_types(params)
+	}
+	return cloned
+}
+
+fn clone_cgen_fixed_array_typedef_map(values map[string]FixedArrayTypedefInfo) map[string]FixedArrayTypedefInfo {
+	mut cloned := map[string]FixedArrayTypedefInfo{}
+	for key, info in values {
+		cloned[key.clone()] = FixedArrayTypedefInfo{
+			arr:    types.ArrayFixed{
+				elem_type: types.new_type_reference(types.Type(types.clone_owned_type(info.arr.elem_type)))
+				len:       info.arr.len
+				len_expr:  info.arr.len_expr.clone()
+			}
+			module: info.module.clone()
+		}
+	}
+	return cloned
+}
+
+fn (mut g FlatGen) publish_fixed_array_support(mut worker FlatGen) {
+	g.fixed_array_typedefs_ready = worker.fixed_array_typedefs_ready
+	if worker.worker_scope != unsafe { nil } {
+		// Same trade as publish_fixed_storage_scan: the typedef table is small,
+		// the discovery scan's scratch is not.
+		g.fixed_array_typedefs_needed = clone_cgen_fixed_array_typedef_map(worker.fixed_array_typedefs_needed)
+		cgen_worker_scope_free(worker.worker_scope)
+		worker.worker_scope = unsafe { nil }
+		return
+	}
+	g.fixed_array_typedefs_needed = worker.fixed_array_typedefs_needed.move()
+}
+
+fn (mut g FlatGen) publish_optional_support(mut worker FlatGen) {
+	g.optional_types_ready = worker.optional_types_ready
+	g.multi_return_types_ready = worker.multi_return_types_ready
+	g.decl_types_ready = worker.decl_types_ready
+	g.selected_decl_types_ready = worker.selected_decl_types_ready
+	g.parallel_worker_scopes << worker.parallel_worker_scopes
+	worker.parallel_worker_scopes = []voidptr{}
+	if worker.worker_scope != unsafe { nil } {
+		// Publish owned copies of the result tables and release the
+		// signature scan's arena instead of keeping it resident through emission.
+		g.needed_optional_types = worker.needed_optional_types.clone_owned()
+		g.optional_pointer_struct_tags = clone_cgen_string_map(worker.optional_pointer_struct_tags)
+		g.multi_return_types = types.clone_owned_types(worker.multi_return_types)
+		g.multi_return_type_names = clone_cgen_string_bool_map(worker.multi_return_type_names)
+		cgen_worker_scope_free(worker.worker_scope)
+		worker.worker_scope = unsafe { nil }
+		return
+	}
+	g.needed_optional_types = worker.needed_optional_types.move()
+	g.optional_pointer_struct_tags = worker.optional_pointer_struct_tags.move()
+	g.multi_return_types = worker.multi_return_types
+	g.multi_return_type_names = worker.multi_return_type_names.move()
+}
+
+fn (mut g FlatGen) publish_unresolved_call_optional_types(mut worker FlatGen) {
+	for name, payload_id in worker.needed_optional_types.ids {
+		// This scan follows declarations in the serial pipeline, including when
+		// two payload spellings map to the same optional typedef name.
+		g.needed_optional_types.set_id(name.clone(), payload_id)
+	}
+	for name, payload in worker.optional_pointer_struct_tags {
+		g.optional_pointer_struct_tags[name.clone()] = payload.clone()
+	}
+	// Only the typedef spellings escape this scan; release its parsing scratch.
+	cgen_worker_scope_free(worker.worker_scope)
+	worker.worker_scope = unsafe { nil }
+}
+
+fn (mut g FlatGen) publish_interface_impl_scan(mut worker FlatGen) {
+	for name, methods in worker.interfaces {
+		if name !in g.interfaces {
+			g.interfaces[name] = methods.clone()
+		}
+	}
+	g.interface_boxed_types_done = worker.interface_boxed_types_done
+	if worker.worker_scope != unsafe { nil } {
+		// Same trade as the other scan publishers: copy the small result tables
+		// and free the scan arena now.
+		g.interface_boxed_types = worker.interface_boxed_types.clone()
+		g.iface_impls = clone_cgen_source_type_list_map(worker.iface_impls)
+		g.iface_type_ids = worker.iface_type_ids.clone()
+		g.ierror_method_emit_names = clone_cgen_string_bool_map(worker.ierror_method_emit_names)
+		cgen_worker_scope_free(worker.worker_scope)
+		worker.worker_scope = unsafe { nil }
+		return
+	}
+	g.interface_boxed_types = worker.interface_boxed_types.move()
+	g.iface_impls = worker.iface_impls.move()
+	g.iface_type_ids = worker.iface_type_ids.move()
+	g.ierror_method_emit_names = worker.ierror_method_emit_names.move()
+}
+
+fn clone_cgen_source_type_list_map(values map[u32][]u32) map[u32][]u32 {
+	mut cloned := map[u32][]u32{}
+	for key, list in values {
+		cloned[key] = list.clone()
+	}
+	return cloned
+}
+
+// gen_fns_dispatch emits fns dispatch output for c.
+fn (mut g FlatGen) gen_fns_dispatch(no_parallel bool) {
+	g.gen_test_failure_global()
+	if no_parallel {
+		if g.scope_parallel_workers {
+			items := g.ensure_fn_gen_items()
+			g.reset_context_lookup_caches()
+			if items.len < min_flat_cgen_parallel_items {
+				g.gen_fn_items(items)
+			} else {
+				// Scoped batches publish their bodies through fn_segs, while the
+				// master's builder is appended afterwards as fn_code. Preserve the
+				// test failure globals ahead of those bodies before resetting the
+				// builder for the synthetic test main.
+				if g.sb.len > 0 {
+					prefix := g.sb.str()
+					unsafe { g.sb.free() }
+					g.sb = strings.new_builder(4096)
+					g.fn_segs << moved_segment(prefix)
+				}
+				g.split_body_fn_ptr_types_from_decls(items.len)
+				g.gen_fn_items_scoped_master_batches(items)
+			}
+		} else {
+			g.gen_fns()
+		}
+		g.gen_synthetic_main_after_fns()
+		return
+	}
+	items := g.ensure_fn_gen_items()
+	g.reset_context_lookup_caches()
+	n_items := items.len
+	if isnil(g.a.worker_pool) {
+		g.a.worker_pool = workers.new(runtime.nr_jobs() - 1)
+	}
+	available_jobs := g.a.worker_pool.size() + 1
+	// Type declarations use one pool task. Once it finishes, that same worker
+	// can drain a queued body task instead of staying reserved for the whole
+	// function-generation phase. Target-header preambles depend on thread use
+	// discovered by body workers, so emit those on the master after they merge.
+	parallel_type_decls := available_jobs > 2 && g.decl_task_eligible(n_items)
+	n_jobs := flat_cgen_job_count(available_jobs, n_items, g.flat_cgen_job_limit())
+	if g.tc.verbose {
+		eprintln('  [ttime]   cg dispatch mode  no_parallel: ${no_parallel}, items: ${n_items}, available: ${available_jobs}, jobs: ${n_jobs}')
+	}
+	if n_items < min_flat_cgen_parallel_items || n_jobs <= 1 {
+		if g.scope_parallel_workers {
+			if n_items < min_flat_cgen_parallel_items {
+				g.gen_fn_items(items)
+			} else {
+				g.split_body_fn_ptr_types_from_decls(n_items)
+				g.gen_fn_items_scoped_master_batches(items)
+			}
+		} else {
+			g.gen_fn_items(items)
+		}
+		g.gen_synthetic_main_after_fns()
+		return
+	}
+	// Freeze the checker's warm type cache (fully populated by the check and
+	// transform phases) as the shared read-only base for every worker's
+	// fresh cache; the master's own memoization writes go to a private
+	// overlay for the duration of the region.
+	mut stsw := time.new_stopwatch()
+	g.tc.freeze_type_cache_for_forks()
+	g.freeze_parallel_lookup_caches()
+	if !g.parallel_prepared {
+		g.prepare_parallel_items(items)
+	}
+	chunk_jobs := if parallel_type_decls {
+		n_jobs * flat_cgen_chunks_per_job
+	} else {
+		n_jobs
+	}
+	mut chunk_items := split_flat_cgen_items(items, chunk_jobs)
+	chunk_count := chunk_items.len
+	g.timing_profile('  [ttime]   cg freeze+split  ${f64(stsw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	stsw.restart()
+	if parallel_type_decls {
+		fail := os.getenv('V3_TEST_PTHREAD_CREATE_FAIL')
+		static_dispatch := fail.len > 0
+		worker_count := if static_dispatch { chunk_count } else { n_jobs }
+		mut cgen_workers := []voidptr{len: worker_count, init: unsafe { nil }}
+		mut ordered_chunk_outputs := []string{}
+		mut ordered_wrapper_defs := []ParallelChunkWrapperDefs{}
+		// Snapshot body-worker state before the declaration task starts mutating
+		// the master generator. Constructing workers lazily from that task's
+		// concurrent state can copy a moved map or a partially updated cache.
+		// All workers can share the prepared literal table until an insertion.
+		// The declaration task must detach too before adding its own literals.
+		g.str_lits_shared = true
+		worker_setup_scope := cgen_worker_scope_begin(true)
+		for ci := 0; ci < worker_count; ci++ {
+			cgen_workers[ci] = voidptr(g.new_parallel_dispatch_worker(ci))
+		}
+		cgen_worker_scope_leave(worker_setup_scope)
+		g.timing_profile('  [ttime]   cg wkr setup     ${f64(stsw.elapsed().microseconds()) / 1000.0:7.2f} ms (workers: ${worker_count})')
+		if static_dispatch {
+			mut args := []FlatCgenChunkArgs{cap: chunk_count}
+			mut tasks := []workers.Task{cap: chunk_count + 1}
+			for ci in 0 .. chunk_count {
+				args << FlatCgenChunkArgs{
+					worker:         cgen_workers[ci]
+					work_items_ptr: unsafe { voidptr(&chunk_items[ci]) }
+				}
+				tasks << workers.Task{
+					run:        flat_cgen_chunk_thread
+					arg:        unsafe { voidptr(&args[ci]) }
+					force_sync: fail == 'cgen:all' || fail == 'cgen:body:all'
+						|| fail == 'cgen:body:${ci}'
+				}
+			}
+			tasks << workers.Task{
+				run:        parallel_type_decls_thread
+				arg:        voidptr(g)
+				force_sync: true
+			}
+			g.parallel_used = g.a.worker_pool.run(tasks)
+		} else {
+			// Long-lived workers pull small source-contiguous chunks from a shared
+			// queue. This balances expression-cost and scheduler variation without
+			// rebuilding the generator caches for every chunk.
+			mut dsw := time.new_stopwatch()
+			ordered_chunk_outputs = []string{len: chunk_count}
+			ordered_wrapper_defs = []ParallelChunkWrapperDefs{len: chunk_count}
+			chunk_queue := chan int{cap: chunk_count}
+			for ci in 0 .. chunk_count {
+				chunk_queue <- ci
+			}
+			chunk_queue.close()
+			mut total_cost := i64(items.len)
+			for item in items {
+				total_cost += item.cost
+			}
+			reserve_cost := total_cost / i64(worker_count) + 1
+			// Function prototypes only read the frozen selection and declaration
+			// tables, like the body workers. Generate them on private generators
+			// beside the type declaration task, which is otherwise the longest lane.
+			// Slicing writes the shared array header on its first use. Do that on
+			// the master before the prototype lanes take their own batch slices.
+			shared_items := items[..]
+			fwd_bounds := forward_decl_lane_bounds(g.a, items)
+			mut fwd_args := []ForwardDeclLaneArgs{cap: fwd_bounds.len - 1}
+			fwd_scope := cgen_worker_scope_begin(true)
+			for lane in 0 .. fwd_bounds.len - 1 {
+				mut fwd_worker := g.new_parallel_worker(max_flat_cgen_jobs + 3 + lane)
+				fwd_worker.tc.verbose = g.tc.verbose
+				fwd_args << ForwardDeclLaneArgs{
+					worker:    voidptr(fwd_worker)
+					items_ptr: unsafe { voidptr(&shared_items) }
+					start:     fwd_bounds[lane]
+					end:       fwd_bounds[lane + 1]
+				}
+			}
+			cgen_worker_scope_leave(fwd_scope)
+			g.parallel_forward_decl_lanes = true
+			mut args := []FlatCgenDynamicArgs{cap: worker_count}
+			mut tasks := []workers.Task{cap: worker_count + 1 + fwd_args.len}
+			tasks << workers.Task{
+				run: parallel_type_decls_thread
+				arg: voidptr(g)
+			}
+			for lane in 0 .. fwd_args.len {
+				tasks << workers.Task{
+					run: forward_decl_lane_thread
+					arg: unsafe { voidptr(&fwd_args[lane]) }
+				}
+			}
+			for ci in 0 .. worker_count {
+				args << FlatCgenDynamicArgs{
+					worker:          cgen_workers[ci]
+					work_chunks_ptr: unsafe { voidptr(&chunk_items) }
+					chunk_queue:     chunk_queue
+					reserve_cost:    reserve_cost
+				}
+				tasks << workers.Task{
+					run:        flat_cgen_dynamic_thread
+					arg:        unsafe { voidptr(&args[ci]) }
+					force_sync: ci == 0
+				}
+			}
+			g.parallel_used = g.a.worker_pool.run(tasks)
+			g.timing_profile('  [ttime]   cg pool.run      ${f64(dsw.elapsed().microseconds()) / 1000.0:7.2f} ms (chunks: ${chunk_count}, workers: ${worker_count})')
+			for fwd_arg in fwd_args {
+				// The lane text lives in its pool thread's arena for the rest of the run.
+				g.parallel_forward_decl_parts << moved_segment(fwd_arg.output)
+			}
+			cgen_worker_scope_free(fwd_scope)
+		}
+		// The declaration thread disables the master's caches while body
+		// workers use their private copies. Restore them for synthetic output.
+		mut msw := time.new_stopwatch()
+		g.reset_context_lookup_caches()
+		g.publish_dispatch_literals_in_chunk_order(cgen_workers)
+		for worker_ptr in cgen_workers {
+			mut w := unsafe { &FlatGen(worker_ptr) }
+			if ordered_chunk_outputs.len > 0 {
+				g.merge_parallel_worker_ordered(w, mut ordered_chunk_outputs, mut ordered_wrapper_defs)
+			} else {
+				g.merge_parallel_worker(w)
+			}
+			g.finish_parallel_worker_scope(mut w)
+		}
+		g.replay_ordered_parallel_wrapper_defs(ordered_wrapper_defs)
+		g.timing_profile('  [ttime]   cg merge         ${f64(msw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+		for output in ordered_chunk_outputs {
+			if output.len > 0 {
+				g.fn_segs << moved_segment(output)
+			}
+		}
+		cgen_worker_scope_free(worker_setup_scope)
+		// Cgen's cache is reset by the driver after this stage. Discard its
+		// overlay so worker-arena memo values cannot escape into the base.
+		g.tc.discard_type_cache_overlay_after_forks()
+		g.gen_synthetic_main_after_fns()
+		if g.sb.len > 0 {
+			g.fn_segs << g.sb.str()
+		}
+		unsafe { g.sb.free() }
+		g.sb = strings.new_builder(0)
+		return
+	}
+	// chunk[0] is emitted by the master directly into its own builder; the
+	// other chunks get helper threads. Function-local temporary names are reset
+	// for each item, so their spelling does not depend on chunk assignment.
+	thread_count := chunk_count - 1
+	mut args := []FlatCgenChunkArgs{cap: chunk_count}
+	args << FlatCgenChunkArgs{
+		worker:         voidptr(g)
+		work_items_ptr: unsafe { voidptr(&chunk_items[0]) }
+		is_master:      true
+	}
+	// Keep helper output in ordered result segments until the join so generated
+	// string IDs can be reconciled with literals emitted by the master chunk.
+	mut cgen_workers := []voidptr{cap: thread_count}
+	if g.scope_parallel_workers {
+		g.str_lits_shared = true
+	}
+	worker_setup_scope := cgen_worker_scope_begin(g.scope_parallel_workers)
+	for ci := 0; ci < thread_count; ci++ {
+		mut w := g.new_parallel_dispatch_worker(ci + 1)
+		cgen_workers << voidptr(w)
+	}
+	for ci := 0; ci < thread_count; ci++ {
+		args << FlatCgenChunkArgs{
+			worker:         cgen_workers[ci]
+			work_items_ptr: unsafe { voidptr(&chunk_items[ci + 1]) }
+		}
+	}
+	cgen_worker_scope_leave(worker_setup_scope)
+	g.split_body_fn_ptr_types_from_decls(n_items)
+	fail := os.getenv('V3_TEST_PTHREAD_CREATE_FAIL')
+	mut tasks := []workers.Task{cap: chunk_count}
+	for ci in 0 .. chunk_count {
+		helper_idx := ci - 1
+		tasks << workers.Task{
+			run:        flat_cgen_chunk_thread
+			arg:        unsafe { voidptr(&args[ci]) }
+			force_sync: ci == 0 || fail == 'cgen:all' || fail == 'cgen:body:all'
+				|| fail == 'cgen:body:${helper_idx}'
+		}
+	}
+	g.parallel_used = g.a.worker_pool.run(tasks)
+	if g.sb.len > 0 {
+		g.fn_segs << g.sb.str()
+	}
+	unsafe { g.sb.free() }
+	g.sb = strings.new_builder(4096)
+	for ci := 0; ci < thread_count; ci++ {
+		mut w := unsafe { &FlatGen(cgen_workers[ci]) }
+		g.merge_parallel_worker(w)
+		g.finish_parallel_worker_scope(mut w)
+	}
+	cgen_worker_scope_free(worker_setup_scope)
+	// Cgen's cache is reset by the driver after this stage. Discard its
+	// overlay so worker-arena memo values cannot escape into the base.
+	g.tc.discard_type_cache_overlay_after_forks()
+	// Synthetic main temps continue after the master's chunk[0] range.
+	g.gen_synthetic_main_after_fns()
+	if g.sb.len > 0 {
+		g.fn_segs << g.sb.str()
+	}
+	unsafe { g.sb.free() }
+	g.sb = strings.new_builder(0)
+}
+
+// decl_task_eligible reports whether gen_fns_dispatch emits the type
+// declarations on a pool task beside the function bodies when the pool has at
+// least three jobs.
+fn (g &FlatGen) decl_task_eligible(n_items int) bool {
+	return g.scope_parallel_workers && !g.program_body_only && g.incremental_fn_names.len == 0
+		&& !g.target_libc_headers && g.cache_const_modules.len == 0
+		&& n_items >= min_flat_cgen_parallel_items
+}
+
+// parallel_decl_task_planned reports whether gen_fns_dispatch will start the
+// declaration task with the current pool and the selected functions.
+fn (g &FlatGen) parallel_decl_task_planned() bool {
+	if isnil(g.a.worker_pool) {
+		return false
+	}
+	available_jobs := g.a.worker_pool.size() + 1
+	n_items := g.fn_gen_items.len
+	return available_jobs > 2 && g.decl_task_eligible(n_items)
+		&& flat_cgen_job_count(available_jobs, n_items, g.flat_cgen_job_limit()) > 1
+}
+
+// split_body_fn_ptr_types_from_decls is called right before function bodies
+// are generated when fewer jobs keep the declaration task from running. That
+// task emits the type declaration block beside the body workers, so it sees
+// only the function-pointer types used before them; types that only bodies
+// use follow the block. Recording the same set here lets
+// write_type_declaration_block place every typedef as the task would, making
+// the generated C independent of the job count.
+fn (mut g FlatGen) split_body_fn_ptr_types_from_decls(n_items int) {
+	if !g.decl_task_eligible(n_items) {
+		return
+	}
+	g.decl_fn_ptr_types = g.used_fn_ptr_types.clone()
+	g.split_body_fn_ptr_types = true
+}
+
+// prepare_serial_fn_tables gives runtime `-no-parallel` generation the same
+// deterministic preseed order as the parallel dispatcher, before constants
+// can allocate string-literal IDs.
+fn (mut g FlatGen) prepare_serial_fn_tables() {
+	if g.parallel_prepared {
+		return
+	}
+	// Parallel pre-dispatch interns the complete source literal table before
+	// selecting functions, because generated bodies can reference declaration
+	// metadata outside their own subtrees. Do the same in the serial path so
+	// `-no-parallel` preserves identical literal IDs and generated C.
+	g.preintern_ast_string_literals()
+	g.want_parallel_prep = true
+	items := g.ensure_fn_gen_items()
+	g.want_parallel_prep = false
+	if items.len >= min_flat_cgen_parallel_items {
+		if _ := g.ierror_interface_name() {
+			g.intern_string('')
+		}
+		g.register_interface_strings()
+		g.parallel_prepared = true
+	}
+}
+
+// freeze_parallel_lookup_caches keeps the warm pre-dispatch caches as immutable
+// bases while the master and every body worker memoize into private overlays.
+fn (mut g FlatGen) freeze_parallel_lookup_caches() {
+	shared_c_name_cache := g.c_name_cache
+	g.c_name_cache = &CNameCache{
+		base: shared_c_name_cache
+	}
+	shared_generic_app_cache := g.generic_app_cache
+	g.generic_app_cache = &GenericAppCache{
+		base: shared_generic_app_cache
+	}
+}
+
+// flat_cgen_job_limit avoids multiplying worker-local caches for small graphs.
+// Keep the wider dispatch for compiler builds and larger reachable programs.
+fn (g &FlatGen) flat_cgen_job_limit() int {
+	if isnil(g.tc) || g.tc.building_v_fast || isnil(g.used_fns)
+		|| g.used_fns.len >= large_flat_cgen_graph_items {
+		return max_flat_cgen_jobs
+	}
+	return max_small_flat_cgen_jobs
+}
+
+// flat_cgen_job_count bounds dispatch by the runtime, available work, and graph limit.
+fn flat_cgen_job_count(n_runtime_jobs int, n_items int, job_limit int) int {
+	if n_runtime_jobs <= 0 || n_items <= 0 {
+		return 0
+	}
+	mut n_jobs := n_runtime_jobs
+	if n_jobs > job_limit {
+		n_jobs = job_limit
+	}
+	if n_jobs > n_items {
+		n_jobs = n_items
+	}
+	return n_jobs
+}
+
+// split_flat_cgen_items supports split flat cgen items handling for c.
+fn split_flat_cgen_items(items []FlatFnGenItem, n_jobs int) [][]FlatFnGenItem {
+	if n_jobs <= 0 || items.len == 0 {
+		return [][]FlatFnGenItem{}
+	}
+	chunk_count := if n_jobs > items.len { items.len } else { n_jobs }
+	mut chunks := [][]FlatFnGenItem{}
+	mut total_cost := 0
+	for item in items {
+		total_cost += item.cost
+	}
+	mut current := []FlatFnGenItem{}
+	mut consumed_cost := 0
+	mut chunk_idx := 0
+	mut chunks_left := chunk_count
+	for idx, item in items {
+		remaining_items := items.len - idx
+		next_target := total_cost * (chunk_idx + 1) / chunk_count
+		// Leave one item for each remaining chunk even if a costly item has
+		// pushed the cumulative target past the remaining functions.
+		if current.len > 0 && chunks_left > 1
+			&& (consumed_cost >= next_target || remaining_items == chunks_left - 1) {
+			chunks << moved_items(current)
+			current = []FlatFnGenItem{}
+			chunk_idx++
+			chunks_left--
+		}
+		current << item
+		consumed_cost += item.cost
+	}
+	if current.len > 0 {
+		chunks << moved_items(current)
+	}
+	return chunks
+}
+
+// moved_items returns its argument unchanged so the caller can append a
+// finished chunk without the implicit deep clone of an addressable array.
+@[inline]
+fn moved_items(items []FlatFnGenItem) []FlatFnGenItem {
+	return items
+}
+
+// stripe_flat_cgen_items mixes several narrow, cost-balanced source ranges
+// into each worker. Cgen work varies by expression kind as well as AST size;
+// striping prevents one worker from inheriting an entire expensive name range.
+fn stripe_flat_cgen_items(chunks [][]FlatFnGenItem, n_jobs int) [][]FlatFnGenItem {
+	if n_jobs <= 0 || chunks.len == 0 {
+		return [][]FlatFnGenItem{}
+	}
+	mut striped := [][]FlatFnGenItem{len: n_jobs}
+	for idx, chunk in chunks {
+		striped[idx % n_jobs] << chunk
+	}
+	return striped
+}
+
+// balance_flat_cgen_chunks assigns narrow, contiguous name ranges by cost,
+// then restores source order within each worker. It keeps type/name caches hot
+// while avoiding the modulo alignment sensitivity of simple striping.
+fn balance_flat_cgen_chunks(chunks [][]FlatFnGenItem, n_jobs int) [][]FlatFnGenItem {
+	if n_jobs <= 0 || chunks.len == 0 {
+		return [][]FlatFnGenItem{}
+	}
+	mut chunk_costs := []i64{len: chunks.len}
+	mut assigned := []bool{len: chunks.len}
+	for idx, chunk in chunks {
+		for item in chunk {
+			chunk_costs[idx] += i64(item.cost) + 1
+		}
+	}
+	mut worker_costs := []i64{len: n_jobs}
+	mut worker_chunks := [][]int{len: n_jobs}
+	for _ in chunks {
+		mut largest := -1
+		for idx, cost in chunk_costs {
+			if !assigned[idx] && (largest < 0 || cost > chunk_costs[largest]) {
+				largest = idx
+			}
+		}
+		mut least_worker := 0
+		for job in 1 .. n_jobs {
+			if worker_costs[job] < worker_costs[least_worker] {
+				least_worker = job
+			}
+		}
+		assigned[largest] = true
+		worker_chunks[least_worker] << largest
+		worker_costs[least_worker] += chunk_costs[largest]
+	}
+	mut balanced := [][]FlatFnGenItem{len: n_jobs}
+	for job, mut chunk_ids in worker_chunks {
+		chunk_ids.sort(a < b)
+		for chunk_id in chunk_ids {
+			balanced[job] << chunks[chunk_id]
+		}
+	}
+	return balanced
+}
+
+// fn_item_cost_and_prep computes the split cost, collects C-extern refs, and
+// pre-seeds function-pointer types in one subtree traversal.
+fn (mut g FlatGen) fn_item_cost_and_prep(node_id flat.NodeId, mut stack []flat.NodeId, mut type_text_cache map[u32]bool) int {
+	// Direct users of this helper (including small standalone generators) may
+	// not have run collect_gen_info's fused literal collection.
+	if !g.ast_string_literals_ready {
+		g.preintern_ast_string_literals()
+	}
+	mut cost := 0
+	// `stack` is a reusable buffer: `top` is the live depth, entries below the
+	// array length are overwritten in place and only a deeper tree appends, so no
+	// per-node push/pop bookkeeping runs. The visiting order is unchanged.
+	mut top := 0
+	if stack.len == 0 {
+		stack << node_id
+	} else {
+		stack[0] = node_id
+	}
+	top = 1
+	for top > 0 {
+		top--
+		current_id := stack[top]
+		idx := int(current_id)
+		if idx < 0 || idx >= g.a.nodes.len {
+			continue
+		}
+		node := unsafe { &g.a.nodes[idx] }
+		cost++
+		// String literals were already interned by the whole-AST literal walk in
+		// prepare_pre_dispatch_master, and C-extern refs are re-collected by the
+		// parallel exact-cost pass that always follows this prep (with a serial
+		// fallback, see refine_fn_item_costs). Keep this walk preseed-only.
+		if node.typ != 0
+			&& g.should_preseed_parallel_type_id_recent_cached(node.typ, mut type_text_cache) {
+			g.preseed_parallel_fn_ptr_type(g.parse_node_type(node))
+		}
+		if expr_type := g.parallel_cached_expr_type(current_id, node) {
+			// Checker-cached expression types repeat the same ~1K canonical
+			// values across hundreds of thousands of nodes; traverse each
+			// distinct value once instead of per node, and only values that can
+			// hold a fn type, the only ones preseed_parallel_fn_ptr_type registers.
+			if type_may_hold_fn_type(expr_type) && g.preseed_type_first_seen(expr_type) {
+				g.preseed_parallel_fn_ptr_type(expr_type)
+			}
+		}
+		for i := node.children_count - 1; i >= 0; i-- {
+			child_id := g.a.children[node.children_start + i]
+			if int(child_id) >= 0 {
+				if top < stack.len {
+					stack[top] = child_id
+				} else {
+					stack << child_id
+				}
+				top++
+			}
+		}
+	}
+	return cost
+}
+
+fn (mut g FlatGen) fn_item_cost_and_c_extern_prep(node_id flat.NodeId, mut stack []flat.NodeId) int {
+	mut cost := 0
+	// `stack` is a reusable buffer: `top` is the live depth, entries below the
+	// array length are overwritten in place and only a deeper tree appends, so no
+	// per-node push/pop bookkeeping runs. The visiting order is unchanged.
+	mut top := 0
+	if stack.len == 0 {
+		stack << node_id
+	} else {
+		stack[0] = node_id
+	}
+	top = 1
+	for top > 0 {
+		top--
+		current_id := stack[top]
+		idx := int(current_id)
+		if idx < 0 || idx >= g.a.nodes.len {
+			continue
+		}
+		node := unsafe { &g.a.nodes[idx] }
+		cost++
+		if node.kind == .selector {
+			g.collect_c_extern_ref_from_node(node)
+		}
+		for i := node.children_count - 1; i >= 0; i-- {
+			child_id := g.a.children[node.children_start + i]
+			if int(child_id) >= 0 {
+				if top < stack.len {
+					stack[top] = child_id
+				} else {
+					stack << child_id
+				}
+				top++
+			}
+		}
+	}
+	return cost
+}
+
+// prepare_parallel_items supports prepare parallel items handling for FlatGen.
+fn (mut g FlatGen) prepare_parallel_items(items []FlatFnGenItem) {
+	mut stack := []flat.NodeId{cap: 256}
+	// Function bodies can materialize literals from declaration metadata (for
+	// example struct-field defaults) that lives outside every function subtree.
+	// Intern all source literals before workers fork so their numeric IDs remain
+	// valid regardless of which chunk first references that metadata.
+	g.preintern_ast_string_literals()
+	// The cache is keyed by the bare type text and reset whenever the
+	// file/module context changes (items are grouped by file, so resets are
+	// rare); the old composite '${file}\n${module}\n${typ}' key allocated a
+	// string per visited node.
+	mut type_text_cache := map[u32]bool{}
+	for item in items {
+		if item.file != g.tc.cur_file || item.module != g.tc.cur_module {
+			type_text_cache.clear()
+		}
+		g.tc.cur_file = item.file
+		g.tc.cur_module = item.module
+		g.prepare_parallel_node(item.node_id, mut stack, mut type_text_cache)
+	}
+	if _ := g.ierror_interface_name() {
+		g.intern_string('')
+	}
+	g.register_interface_strings()
+}
+
+// prepare_parallel_node supports prepare parallel node handling for FlatGen.
+fn (mut g FlatGen) prepare_parallel_node(id flat.NodeId, mut stack []flat.NodeId, mut type_text_cache map[u32]bool) {
+	// Same reusable-buffer walk as exact_flat_fn_gen_item_cost_and_prep.
+	mut top := 0
+	if stack.len == 0 {
+		stack << id
+	} else {
+		stack[0] = id
+	}
+	top = 1
+	for top > 0 {
+		top--
+		current_id := stack[top]
+		idx := int(current_id)
+		if idx < 0 || idx >= g.a.nodes.len {
+			continue
+		}
+		node := unsafe { &g.a.nodes[idx] }
+		if node.kind == .string_literal && !node.is_embed_payload() {
+			g.intern_string(node.value)
+		}
+		g.collect_c_extern_ref_from_node(node)
+		if node.typ != 0
+			&& g.should_preseed_parallel_type_id_cached(node.typ, mut type_text_cache) {
+			g.preseed_parallel_fn_ptr_type(g.parse_node_type(node))
+		}
+		if expr_type := g.parallel_cached_expr_type(current_id, node) {
+			g.preseed_parallel_fn_ptr_type(expr_type)
+		}
+		for i := node.children_count - 1; i >= 0; i-- {
+			child_id := g.a.children[node.children_start + i]
+			if int(child_id) >= 0 {
+				if top < stack.len {
+					stack[top] = child_id
+				} else {
+					stack << child_id
+				}
+				top++
+			}
+		}
+	}
+}
+
+fn (g &FlatGen) parallel_cached_expr_type(id flat.NodeId, node &flat.Node) ?types.Type {
+	idx := int(id)
+	if idx < 0 {
+		return none
+	}
+	if g.tc.parallel_check_sparse && (idx < g.tc.check_range_lo || idx > g.tc.check_range_hi) {
+		if g.tc.sparse_expr_type_values.len == 0 && node.kind != .call {
+			return none
+		}
+		if t := g.tc.sparse_expr_type_values[idx] {
+			return t
+		}
+		if node.kind == .call {
+			if name := g.resolved_call_name(id) {
+				if t := g.tc.fn_ret_types[name] {
+					return t
+				}
+			}
+		}
+		return none
+	}
+	if idx < g.tc.expr_type_set.len && idx < g.tc.expr_type_values.len && g.tc.expr_type_set[idx] {
+		return *g.tc.expr_type_values[idx]
+	}
+	if node.kind == .call && idx < g.tc.resolved_call_set.len && idx < g.tc.resolved_call_names.len
+		&& g.tc.resolved_call_set[idx] {
+		name := g.tc.resolved_call_names[idx].value
+		if t := g.tc.fn_ret_types[name] {
+			return t
+		}
+	}
+	return none
+}
+
+// FlatCgenPrepCandidate is one deferred fn-ptr preseed action discovered by a
+// parallel prep worker, replayed by the master in source order so the typedef
+// registration order matches the former serial walk exactly.
+struct FlatCgenPrepCandidate {
+	is_expr  bool
+	text     u32        // source type ID (is_expr == false)
+	typ      types.Type // checker-cached expr type (is_expr == true)
+	item_idx int
+}
+
+struct ResolvedCallTypeCache {
+mut:
+	ptrs    [4096]voidptr
+	lens    [4096]int
+	indexes [4096]u32
+	values  []types.Type
+	seen    [4096]bool
+	found   [4096]bool
+}
+
+// exact_flat_fn_gen_item_cost_and_prep is exact_flat_fn_gen_item_cost plus the
+// candidate collection of the former serial fused prep walk: distinct type
+// texts and distinct cached expression types, in encounter order. All FlatGen
+// and checker access is read-only (nothing writes the dense expr caches during
+// cgen; every remember_expr_type caller is a mut check-phase path).
+@[direct_array_access]
+fn exact_flat_fn_gen_item_cost_and_prep(g &FlatGen, node_id flat.NodeId, item_idx int, mut c_extern_refs map[string]bool, mut stack []flat.NodeId, mut cands []FlatCgenPrepCandidate, mut text_cache PrepTypTextCache, mut type_seen PreseedTypeSeen, mut resolved_call_cache ResolvedCallTypeCache) (int, bool) {
+	a := g.a
+	mut cost := 0
+	mut needs_prelude_scan := false
+	// `stack` is a reusable buffer: `top` is the live depth, entries below the
+	// array length are overwritten in place and only a deeper tree appends, so no
+	// per-node push/pop bookkeeping runs. The visiting order is unchanged.
+	mut top := 0
+	if stack.len == 0 {
+		stack << node_id
+	} else {
+		stack[0] = node_id
+	}
+	top = 1
+	for top > 0 {
+		top--
+		id := stack[top]
+		idx := int(id)
+		if idx < 0 || idx >= a.nodes.len {
+			continue
+		}
+		node := unsafe { &a.nodes[idx] }
+		cost += flat_cgen_node_cost(node.kind)
+		if node.kind == .lock_expr || node.kind == .label_stmt
+			|| (node.kind == .defer_stmt && node.value == 'function')
+			|| c_call_needs_prelude_scan(a, node) {
+			needs_prelude_scan = true
+		}
+		if node.kind == .selector && node.children_count > 0 && node.value.len > 0 {
+			base_id := a.children[node.children_start]
+			if int(base_id) >= 0 {
+				base := unsafe { &a.nodes[int(base_id)] }
+				if base.kind == .ident && base.value == 'C' {
+					raw_name := 'C.${node.value}'
+					raw_cfn := naming.c_name(raw_name)
+					c_extern_refs[raw_name] = true
+					c_extern_refs[raw_cfn] = true
+					c_extern_refs[g.c_extern_export_name(raw_cfn)] = true
+				}
+			}
+		}
+		if node.typ != 0 {
+			slot := int(node.typ & 4095)
+			if text_cache.gens[slot] != text_cache.generation || text_cache.ids[slot] != node.typ {
+				text_cache.ids[slot] = node.typ
+				text_cache.gens[slot] = text_cache.generation
+				text_cache.verdicts[slot] = parallel_type_text_may_preseed(g, node.typ)
+				if text_cache.verdicts[slot] {
+					cands << FlatCgenPrepCandidate{ text: node.typ, item_idx: item_idx }
+				}
+			}
+		}
+		if expr_type := g.parallel_cached_expr_type_with_cache(id, node, mut resolved_call_cache) {
+			// preseed_parallel_fn_ptr_type registers nothing for a value without a
+			// nested fn type, which is most checked expression types; skip hashing them.
+			if type_may_hold_fn_type(expr_type) && type_seen.insert(expr_type) {
+				cands << FlatCgenPrepCandidate{
+					is_expr:  true
+					typ:      expr_type
+					item_idx: item_idx
+				}
+			}
+		}
+		for i := node.children_count - 1; i >= 0; i-- {
+			child_id := a.children[node.children_start + i]
+			if int(child_id) >= 0 {
+				if top < stack.len {
+					stack[top] = child_id
+				} else {
+					stack << child_id
+				}
+				top++
+			}
+		}
+	}
+	return cost, needs_prelude_scan
+}
+
+@[direct_array_access]
+fn (g &FlatGen) parallel_cached_expr_type_with_cache(id flat.NodeId, node &flat.Node, mut cache ResolvedCallTypeCache) ?types.Type {
+	idx := int(id)
+	if idx < 0 {
+		return none
+	}
+	mut name := ''
+	if g.tc.parallel_check_sparse && (idx < g.tc.check_range_lo || idx > g.tc.check_range_hi) {
+		// Same answer as parallel_cached_expr_type; the call's declared return
+		// type goes through the name-keyed cache below like a parsed call's.
+		if g.tc.sparse_expr_type_values.len != 0 {
+			if t := g.tc.sparse_expr_type_values[idx] {
+				return t
+			}
+		}
+		if node.kind != .call {
+			return none
+		}
+		name = g.resolved_call_name(id) or { return none }
+	} else {
+		if idx < g.tc.expr_type_set.len && idx < g.tc.expr_type_values.len
+			&& g.tc.expr_type_set[idx] {
+			return *g.tc.expr_type_values[idx]
+		}
+		if node.kind != .call || idx >= g.tc.resolved_call_set.len
+			|| idx >= g.tc.resolved_call_names.len || !g.tc.resolved_call_set[idx] {
+			return none
+		}
+		name = g.tc.resolved_call_names[idx].value
+	}
+	slot := int((u64(voidptr(name.str)) >> 4 ^ u64(name.len)) & 4095)
+	if cache.seen[slot] && cache.ptrs[slot] == voidptr(name.str) && cache.lens[slot] == name.len {
+		if cache.found[slot] {
+			return cache.values[int(cache.indexes[slot] - 1)]
+		}
+		return none
+	}
+	cache.ptrs[slot] = voidptr(name.str)
+	cache.lens[slot] = name.len
+	cache.seen[slot] = true
+	if typ := g.tc.fn_ret_types[name] {
+		index := cache.indexes[slot]
+		if index == 0 {
+			cache.values << typ
+			cache.indexes[slot] = u32(cache.values.len)
+		} else {
+			cache.values[int(index - 1)] = typ
+		}
+		cache.found[slot] = true
+		return typ
+	}
+	cache.found[slot] = false
+	return none
+}
+
+// parallel_type_text_may_preseed cheaply rejects builtin/container type text
+// before the exact-cost workers retain it for the ordered alias/fn-type replay.
+// V alias declarations are capitalized; literal callback types are the only
+// lowercase text that can require a function-pointer preseed.
+fn parallel_type_text_may_preseed(g &FlatGen, typ_id u32) bool {
+	if typ_id == 0 { return false }
+	syntax := flat.source_type_syntax(typ_id)
+	return syntax.parallel_preseed_fn() || (syntax.parallel_preseed_short() != 0
+		&& syntax.parallel_preseed_short() in g.prep_alias_short_names)
+}
+
+// par_cgen_prep_enabled gates the parallel fused item prep, so a single binary
+// can A/B or disable it (`V3_NO_PAR_CGEN_PREP=1`).
+fn par_cgen_prep_enabled() bool {
+	return os.getenv('V3_NO_PAR_CGEN_PREP') == ''
+}
+
+fn (mut g FlatGen) should_preseed_parallel_type_id_recent_cached(id u32, mut cache map[u32]bool) bool {
+	mut recent := g.prep_typ_text_cache
+	if isnil(recent) {
+		return g.should_preseed_parallel_type_id_cached(id, mut cache)
+	}
+	slot := int(id & 4095)
+	if recent.gens[slot] == recent.generation && recent.ids[slot] == id {
+		return recent.verdicts[slot]
+	}
+	verdict := g.should_preseed_parallel_type_id_cached(id, mut cache)
+	recent.ids[slot] = id
+	recent.gens[slot] = recent.generation
+	recent.verdicts[slot] = verdict
+	return verdict
+}
+
+fn (g &FlatGen) should_preseed_parallel_type_id_cached(id u32, mut cache map[u32]bool) bool {
+	if id == 0 {
+		return false
+	}
+	if cached := cache[id] {
+		return cached
+	}
+	verdict := g.should_preseed_parallel_type_text(id)
+	cache[id] = verdict
+	return verdict
+}
+
+// should_preseed_parallel_type_text reports whether should preseed parallel type text applies in c.
+fn (g &FlatGen) should_preseed_parallel_type_text(typ_id u32) bool {
+	if typ_id == 0 {
+		return false
+	}
+	clean_id := g.parallel_base_type_text(typ_id)
+	if flat.source_type_syntax(clean_id).function_fragment() {
+		return true
+	}
+	if g.tc.type_aliases.contains(clean_id) {
+		return true
+	}
+	qualified_qtyp_id := g.tc.qualify_type_name(clean_id)
+	return g.tc.type_aliases.contains(qualified_qtyp_id)
+}
+
+// parallel_base_type_text supports parallel base type text handling for FlatGen.
+fn (g &FlatGen) parallel_base_type_text(typ_id u32) u32 {
+	mut clean := flat.source_type_syntax(typ_id).trimmed()
+	for clean != 0 {
+		shape := flat.source_type_shape(clean)
+		if shape.has(.shared_type) || shape.has(.pointer) || shape.has(.option_type)
+			|| shape.has(.result_type) || shape.has(.variadic) || shape.has(.array_type) {
+			clean = flat.source_type_syntax(flat.source_type_syntax(clean).raw_base()).trimmed()
+		} else {
+			break
+		}
+	}
+	return clean
+}
+
+// preseed_parallel_fn_ptr_type supports preseed parallel fn ptr type handling for FlatGen.
+// type_may_hold_fn_type reports whether preseed_parallel_fn_ptr_type can reach a
+// fn type inside `typ`; it mirrors that walk without registering anything.
+fn type_may_hold_fn_type(typ types.Type) bool {
+	if typ is types.FnType {
+		return true
+	} else if typ is types.Pointer {
+		return type_may_hold_fn_type(typ.base_type)
+	} else if typ is types.Array {
+		return type_may_hold_fn_type(typ.elem_type)
+	} else if typ is types.ArrayFixed {
+		return type_may_hold_fn_type(typ.elem_type)
+	} else if typ is types.Map {
+		return type_may_hold_fn_type(typ.key_type) || type_may_hold_fn_type(typ.value_type)
+	} else if typ is types.OptionType {
+		return type_may_hold_fn_type(typ.base_type)
+	} else if typ is types.ResultType {
+		return type_may_hold_fn_type(typ.base_type)
+	} else if typ is types.Alias {
+		return type_may_hold_fn_type(typ.base_type)
+	} else if typ is types.MultiReturn {
+		for item in typ.types {
+			if type_may_hold_fn_type(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+fn (mut g FlatGen) preseed_parallel_fn_ptr_type(typ types.Type) {
+	if typ is types.FnType {
+		g.register_fn_ptr_type(g.fn_ptr_type_key(typ))
+		for parameter in typ.params {
+			param := parameter.typ
+			g.preseed_parallel_fn_ptr_type(param)
+		}
+		g.preseed_parallel_fn_ptr_type(typ.return_type)
+	} else if typ is types.Pointer {
+		g.preseed_parallel_fn_ptr_type(typ.base_type)
+	} else if typ is types.Array {
+		g.preseed_parallel_fn_ptr_type(typ.elem_type)
+	} else if typ is types.ArrayFixed {
+		g.preseed_parallel_fn_ptr_type(typ.elem_type)
+	} else if typ is types.Map {
+		g.preseed_parallel_fn_ptr_type(typ.key_type)
+		g.preseed_parallel_fn_ptr_type(typ.value_type)
+	} else if typ is types.OptionType {
+		g.preseed_parallel_fn_ptr_type(typ.base_type)
+	} else if typ is types.ResultType {
+		g.preseed_parallel_fn_ptr_type(typ.base_type)
+	} else if typ is types.Alias {
+		g.preseed_parallel_fn_ptr_type(typ.base_type)
+	} else if typ is types.MultiReturn {
+		for item in typ.types {
+			g.preseed_parallel_fn_ptr_type(item)
+		}
+	}
+}
+
+// new_parallel_worker builds a per-worker FlatGen for parallel codegen.
+//
+// The lookup tables populated before gen_fns_dispatch (in collect_gen_info,
+// collect_interface_impls and the precompute_* passes) are READ-ONLY during codegen, so
+// they are SHARED by reference instead of cloned — V maps/arrays are reference types and
+// concurrent readers are safe. Only the state a worker actually mutates while emitting is
+// kept private: the output builder; the string-literal table (interned during gen); the
+// fn_ptr_types / needed_optional_types / emitted_* sets and the param_types_cache /
+// array method memoization caches (all written during gen); the per-function
+// cur_param_* scratch; and runtime_inits (kept private out of caution). This drops the
+// bulk of each worker's clone cost — previously the whole table set was duplicated per
+// worker and, under -gc none, never freed.
+fn (g &FlatGen) new_parallel_worker(worker_id int) &FlatGen {
+	return g.new_parallel_worker_config(worker_id, false)
+}
+
+// collect_fixed_storage_consts_scoped discards the full-AST scan's temporary
+// name-resolution state after copying its small result set to the master.
+fn (mut g FlatGen) collect_fixed_storage_consts_scoped() {
+	scope := cgen_worker_scope_begin(true)
+	mut worker := g.new_parallel_worker(6)
+	worker.fixed_storage_consts = g.fixed_storage_consts.clone()
+	worker.collect_fixed_storage_consts(false)
+	cgen_worker_scope_leave(scope)
+	for name, enabled in worker.fixed_storage_consts {
+		if enabled {
+			g.fixed_storage_consts[name.clone()] = true
+		}
+	}
+	cgen_worker_scope_free(scope)
+}
+
+// preseed_c_extern_fn_ptr_types_scoped keeps the C-declaration scan's large
+// resolution scratch out of the long-lived cgen arena.
+fn (mut g FlatGen) preseed_c_extern_fn_ptr_types_scoped() {
+	scope := cgen_worker_scope_begin(true)
+	mut worker := g.new_parallel_worker(7)
+	g.configure_c_extern_scan_worker(mut worker)
+	worker.preseed_c_extern_fn_ptr_types()
+	cgen_worker_scope_leave(scope)
+	g.publish_c_extern_type_discoveries(worker)
+	cgen_worker_scope_free(scope)
+}
+
+// c_extern_forward_decls_scoped renders C prototypes in a disposable worker
+// and copies only their compact text and discovered ABI types to the master.
+fn (mut g FlatGen) c_extern_forward_decls_scoped() {
+	scope := cgen_worker_scope_begin(true)
+	mut worker := g.new_parallel_worker(8)
+	g.configure_c_extern_scan_worker(mut worker)
+	worker.c_extern_forward_decls()
+	mut output := unsafe { worker.sb.reuse_as_plain_u8_array() }
+	cgen_worker_scope_leave(scope)
+	g.publish_c_extern_type_discoveries(worker)
+	unsafe { g.sb.write_ptr(output.data, output.len) }
+	unsafe { output.free() }
+	cgen_worker_scope_free(scope)
+}
+
+fn (g &FlatGen) configure_c_extern_scan_worker(mut worker FlatGen) {
+	worker.target = g.target
+	worker.needs_shared_runtime = g.needs_shared_runtime
+	worker.preinclude_directives = g.preinclude_directives
+	worker.c_directives = g.c_directives
+	worker.inlined_c_fns = g.inlined_c_fns.clone()
+	worker.inlined_c_declared_fns = g.inlined_c_declared_fns.clone()
+	worker.files_with_c_includes = g.files_with_c_includes.clone()
+	worker.files_with_c_postincludes = g.files_with_c_postincludes.clone()
+	worker.files_linking_c_sources = g.files_linking_c_sources.clone()
+	worker.mods_with_c_libs = g.mods_with_c_libs.clone()
+	worker.mods_with_c_includes = g.mods_with_c_includes.clone()
+	worker.c_extern_forced_decls = g.c_extern_forced_decls.clone()
+	worker.inlined_c_active_macros = g.inlined_c_active_macros.clone()
+	worker.inlined_c_static_fns = g.inlined_c_static_fns.clone()
+	worker.cache_omitted_c_fns = g.cache_omitted_c_fns.clone()
+}
+
+fn (mut g FlatGen) publish_c_extern_type_discoveries(worker &FlatGen) {
+	if !g.c_extern_refs_ready && worker.c_extern_refs_ready {
+		// Publication runs after leaving the scan's disposable arena. Keep its
+		// complete immutable result, including owned keys, for later consumers.
+		g.c_extern_refs = clone_cgen_string_bool_map(worker.c_extern_refs)
+		g.c_extern_refs_ready = true
+	}
+	for opt_name, val_type_id in worker.needed_optional_types.ids {
+		if !g.needed_optional_types.contains(opt_name) {
+			g.needed_optional_types.set_id(opt_name.clone(), val_type_id)
+		}
+	}
+	for opt_name, val_type in worker.optional_pointer_struct_tags {
+		if opt_name !in g.optional_pointer_struct_tags {
+			g.optional_pointer_struct_tags[opt_name.clone()] = val_type.clone()
+		}
+	}
+	for encoded, name in worker.fn_ptr_types {
+		if encoded !in g.fn_ptr_types {
+			g.fn_ptr_types[encoded.clone()] = name.clone()
+		}
+	}
+	for encoded, used in worker.used_fn_ptr_types {
+		if used {
+			g.used_fn_ptr_types[encoded.clone()] = true
+		}
+	}
+	for name, enabled in worker.libc_compat_fns {
+		if enabled {
+			g.libc_compat_fns[name.clone()] = true
+		}
+	}
+}
+
+fn (g &FlatGen) new_parallel_tail_worker(worker_id int) &FlatGen {
+	mut w := g.new_parallel_worker(worker_id)
+	w.is_shared = g.is_shared
+	// gen_vinit pairs each initializer with its owning module. These arrays are
+	// declaration-task output and remain read-only while the tail is generated.
+	w.const_runtime_init_modules = g.const_runtime_init_modules.clone()
+	w.runtime_init_modules = g.runtime_init_modules.clone()
+	return w
+}
+
+// new_parallel_dispatch_worker selects the lightweight accumulator only when
+// scoped batching keeps all actual emission in fresh full workers.
+fn (g &FlatGen) new_parallel_dispatch_worker(worker_id int) &FlatGen {
+	if g.scope_parallel_workers {
+		return g.new_parallel_result_worker(worker_id)
+	}
+	return g.new_parallel_worker(worker_id)
+}
+
+// new_parallel_result_worker creates a non-emitting helper accumulator. Caches
+// that it only passes to fresh batch generators stay shared with the frozen
+// master snapshot; result tables remain private. String tables can also stay
+// shared when the master detaches its own table on insertion. Other callers
+// still receive an independent snapshot before the master can extend its table.
+fn (g &FlatGen) new_parallel_result_worker(worker_id int) &FlatGen {
+	return g.new_parallel_worker_config(worker_id, true)
+}
+
+fn (g &FlatGen) new_parallel_worker_config(worker_id int, result_only bool) &FlatGen {
+	mut w := &FlatGen{
+		sb:                                 strings.new_builder(if result_only { 0 } else { 64_000 })
+		a:                                  unsafe { g.a }
+		used_fns:                           g.used_fns
+		used_fn_names:                      g.used_fn_names
+		fn_gen_items:                       g.fn_gen_items
+		top_level_node_ids:                 g.top_level_node_ids
+		type_metadata_node_ids:             g.type_metadata_node_ids
+		type_metadata_nodes_ready:          g.type_metadata_nodes_ready
+		main_type_aliases_absent:           g.main_type_aliases_absent
+		sparse_call_name_index:             g.sparse_call_name_index
+		sparse_call_name_values:            g.sparse_call_name_values
+		sparse_call_name_index_base:        g.sparse_call_name_index_base
+		sparse_call_name_index_ready:       g.sparse_call_name_index_ready
+		sizeof_offsetof_node_ids:           g.sizeof_offsetof_node_ids
+		sizeof_offsetof_nodes_ready:        g.sizeof_offsetof_nodes_ready
+		embed_payload_node_ids:             g.embed_payload_node_ids
+		embed_payload_nodes_ready:          g.embed_payload_nodes_ready
+		test_files:                         if result_only {
+			g.test_files
+		} else {
+			g.test_files.clone()
+		}
+		show_test_stats:                    g.show_test_stats
+		print_fn_names:                     g.print_fn_names
+		is_prod:                            g.is_prod
+		is_debug:                           g.is_debug
+		race:                               g.race
+		line_directives:                    g.line_directives
+		vlines:                             g.vlines
+		uses_recover:                       g.uses_recover
+		check_overflow:                     g.check_overflow
+		check_casts:                        g.check_casts
+		check_scope_vlib_prefixes:          g.check_scope_vlib_prefixes
+		force_bounds_checking:              g.force_bounds_checking
+		object_file_mode:                   g.object_file_mode
+		cache_program_files:                g.cache_program_files
+		incremental_fn_names:               g.incremental_fn_names
+		cached_support_identifiers:         g.cached_support_identifiers
+		cached_program_cleanup:             g.cached_program_cleanup
+		str_lits:                           if result_only && !g.str_lits_shared {
+			clone_cgen_string_list(g.str_lits)
+		} else if g.scope_parallel_workers {
+			g.str_lits
+		} else {
+			g.str_lits.clone()
+		}
+		str_lit_ids:                        if result_only && !g.str_lits_shared {
+			clone_cgen_string_int_map(g.str_lit_ids)
+		} else if g.scope_parallel_workers {
+			g.str_lit_ids
+		} else {
+			g.str_lit_ids.clone()
+		}
+		str_lits_shared:                    g.scope_parallel_workers && (!result_only || g.str_lits_shared)
+		str_lits_base_len:                  g.str_lits.len
+		global_types:                       g.global_types
+		global_raw_type_texts:              g.global_raw_type_texts
+		global_shared_storage_present:      g.global_shared_storage_present
+		enum_vals:                          g.enum_vals
+		enum_value_exprs:                   g.enum_value_exprs
+		enum_values_from_c:                 g.enum_values_from_c
+		enum_modules:                       g.enum_modules
+		interfaces:                         g.interfaces
+		const_vals:                         g.const_vals
+		const_modules:                      g.const_modules
+		const_init_order:                   g.const_init_order
+		fixed_storage_consts:               g.fixed_storage_consts
+		global_modules:                     g.global_modules
+		global_inits:                       g.global_inits
+		global_init_order:                  g.global_init_order
+		c_decl_abi_names:                   g.c_decl_abi_names
+		c_extern_forced_decls:              g.c_extern_forced_decls
+		export_c_abi_decls:                 g.export_c_abi_decls
+		main_export_owners:                 g.main_export_owners
+		main_export_c_abi_wrappers:         g.main_export_c_abi_wrappers
+		c_extern_global_names:              g.c_extern_global_names
+		export_global_names:                g.export_global_names
+		global_linker_sections:             g.global_linker_sections
+		global_cinit_names:                 g.global_cinit_names
+		enum_backing_infos:                 g.enum_backing_infos
+		referenced_c_struct_ids:            g.referenced_c_struct_ids
+		referenced_c_struct_ids_ready:      g.referenced_c_struct_ids_ready
+		iface_impls:                        g.iface_impls
+		interface_dispatch_required:        g.interface_dispatch_required
+		iface_type_ids:                     g.iface_type_ids
+		interface_boxed_types:              g.interface_boxed_types
+		interface_boxed_types_done:         g.interface_boxed_types_done
+		ierror_method_emit_names:           g.ierror_method_emit_names
+		recursive_drop_helpers:             g.recursive_drop_helpers
+		sum_name_lookup:                    g.sum_name_lookup
+		sum_variant_lookup:                 g.sum_variant_lookup
+		sum_variant_actual_cache:           &SumVariantActualCache{}
+		module_init_fns:                    g.module_init_fns
+		module_init_fn_modules:             g.module_init_fn_modules
+		module_cleanup_fns:                 g.module_cleanup_fns
+		module_cleanup_fn_modules:          g.module_cleanup_fn_modules
+		module_imports:                     g.module_imports
+		inlined_c_structs:                  g.inlined_c_structs
+		inlined_c_typedef_names:            g.inlined_c_typedef_names
+		inlined_c_fns:                      g.inlined_c_fns
+		inlined_c_declared_fns:             g.inlined_c_declared_fns
+		files_with_c_includes:              g.files_with_c_includes
+		files_with_c_postincludes:          g.files_with_c_postincludes
+		files_linking_c_sources:            g.files_linking_c_sources
+		mods_with_c_libs:                   g.mods_with_c_libs
+		mods_with_c_includes:               g.mods_with_c_includes
+		inlined_c_active_macros:            g.inlined_c_active_macros
+		inlined_c_static_fns:               g.inlined_c_static_fns
+		libc_compat_fns:                    g.libc_compat_fns.clone()
+		tc:                                 if result_only {
+			unsafe { g.tc }
+		} else {
+			g.clone_parallel_type_checker()
+		}
+		has_builtins:                       g.has_builtins
+		cache_split:                        g.cache_split
+		cache_stable_symbols:               g.cache_stable_symbols
+		embed_incbin:                       g.embed_incbin
+		embed_incbin_syms:                  g.embed_incbin_syms
+		embed_incbin_syms_ready:            g.embed_incbin_syms_ready
+		compile_defines:                    g.compile_defines
+		compile_values:                     g.compile_values
+		trace_calls:                        g.trace_calls
+		is_trace_calls:                     g.is_trace_calls
+		trace_fns:                          g.trace_fns
+		skip_generics:                      g.skip_generics
+		tmp_count:                          (worker_id + 1) * 100_000
+		line_start:                         true
+		modules:                            g.modules
+		fn_ptr_types:                       g.fn_ptr_types.clone()
+		used_fn_ptr_types:                  if g.scope_parallel_workers {
+			map[string]bool{}
+		} else {
+			g.used_fn_ptr_types.clone()
+		}
+		fixed_array_ret_wrappers:           g.fixed_array_ret_wrappers
+		concrete_optional_abi_fns:          g.concrete_optional_abi_fns
+		fn_decl_param_types:                g.fn_decl_param_types
+		fn_decl_variadic:                   g.fn_decl_variadic
+		fn_decl_variadic_short_counts:      g.fn_decl_variadic_short_counts
+		fn_decl_shared_params:              g.fn_decl_shared_params
+		fn_shared_params_resolved:          g.fn_shared_params_resolved
+		shared_param_index_empty:           g.shared_param_index_empty
+		has_shared_params:                  g.has_shared_params
+		fn_decl_mut_receivers:              g.fn_decl_mut_receivers
+		specialized_method_c_names:         g.specialized_method_c_names
+		fn_decl_ret_types:                  g.fn_decl_ret_types
+		fn_decl_nodes_by_name:              g.fn_decl_nodes_by_name
+		non_generic_fn_names_by_module:     g.non_generic_fn_names_by_module
+		generic_fn_keys_by_short:           g.generic_fn_keys_by_short
+		generic_fn_keys_by_cname:           g.generic_fn_keys_by_cname
+		generic_fn_key_ordinal:             g.generic_fn_key_ordinal
+		struct_decl_infos:                  g.struct_decl_infos
+		struct_decl_short_infos:            g.struct_decl_short_infos
+		decl_attrs:                         g.decl_attrs
+		decl_attrs_by_source_position:      g.decl_attrs_by_source_position
+		shared_type_names:                  g.shared_type_names
+		shared_alias_pointer_shorts:        g.shared_alias_pointer_shorts
+		shared_alias_pointer_cache:         if result_only {
+			g.shared_alias_pointer_cache
+		} else {
+			clone_shared_alias_pointer_cache(g.shared_alias_pointer_cache)
+		}
+		shared_alias_index_ready:           g.shared_alias_index_ready
+		needs_pthread_header:               g.needs_pthread_header
+		needs_thread_type:                  g.needs_thread_type
+		needs_thread_runtime:               g.needs_thread_runtime
+		const_runtime_inits:                if result_only {
+			g.const_runtime_inits
+		} else {
+			g.const_runtime_inits.clone()
+		}
+		runtime_inits:                      if result_only {
+			g.runtime_inits
+		} else {
+			g.runtime_inits.clone()
+		}
+		compiler_vroot:                     g.compiler_vroot
+		compiler_vexe:                      g.compiler_vexe
+		live_source_path:                   g.live_source_path
+		live_rebuild_options:               g.live_rebuild_options
+		compiler_vexe_env_setup:            g.compiler_vexe_env_setup
+		ccompiler:                          g.ccompiler
+		tcc_program_unit:                   g.tcc_program_unit
+		native_function_aliases:            g.native_function_aliases
+		is_shared:                          g.is_shared
+		target:                             g.target
+		// `int_ct` is derived from the target by set_target, which a worker never
+		// calls. Without copying it a worker keeps the 64-bit default and emits an
+		// `i64` body for a prototype the master declared as `i32` on a 32-bit target.
+		int_ct:                             g.int_ct
+		output_cross_c:                     g.output_cross_c
+		subsystem:                          g.subsystem
+		target_libc_headers:                g.target_libc_headers
+		c_flags:                            g.c_flags
+		suppress_main:                      g.suppress_main
+		cur_param_names:                    if result_only {
+			g.cur_param_names
+		} else {
+			g.cur_param_names.clone()
+		}
+		cur_param_type_values:              if result_only {
+			g.cur_param_type_values
+		} else {
+			g.cur_param_type_values.clone()
+		}
+		cur_param_types:                    if result_only {
+			g.cur_param_types
+		} else {
+			g.cur_param_types.clone()
+		}
+		cur_param_name_bits:                g.cur_param_name_bits
+		cur_mut_param_name_bits:            g.cur_mut_param_name_bits
+		cur_concrete_optional_params:       if result_only {
+			g.cur_concrete_optional_params
+		} else {
+			g.cur_concrete_optional_params.clone()
+		}
+		cur_mut_params:                     if result_only {
+			g.cur_mut_params
+		} else {
+			g.cur_mut_params.clone()
+		}
+		cur_mut_pointer_params:             if result_only {
+			g.cur_mut_pointer_params
+		} else {
+			g.cur_mut_pointer_params.clone()
+		}
+		cur_explicit_mut_pointer_params:    if result_only {
+			g.cur_explicit_mut_pointer_params
+		} else {
+			g.cur_explicit_mut_pointer_params.clone()
+		}
+		cur_mut_param_owners:               if result_only {
+			g.cur_mut_param_owners
+		} else {
+			g.cur_mut_param_owners.clone()
+		}
+		cur_fn_ret:                         g.cur_fn_ret
+		cur_fn_ret_is_optional:             g.cur_fn_ret_is_optional
+		cur_fn_ret_base:                    g.cur_fn_ret_base
+		memo_usable_expr_types:             g.memo_usable_expr_types
+		import_key_cache:                   &util.KeyRecentCache{}
+		cache_struct_fields:                g.cache_struct_fields
+		dedup_fn_decl_aliases:              g.dedup_fn_decl_aliases
+		prefix_param_scan:                  g.prefix_param_scan
+		lean_parallel_worker_init:          g.lean_parallel_worker_init
+		lazy_param_abi_merge:               g.lazy_param_abi_merge
+		expected_expr_type:                 g.expected_expr_type
+		expected_enum:                      g.expected_enum
+		needed_optional_types:              g.needed_optional_types.clone()
+		optional_pointer_struct_tags:       g.optional_pointer_struct_tags.clone()
+		optional_types_ready:               g.optional_types_ready
+		// Declaration emission grows the master's set while scoped dispatchers
+		// fork chunk workers. Keep their snapshot private before tasks start.
+		emitted_optional_types:             g.emitted_optional_types.clone()
+		array_method_cache:                 if result_only {
+			g.array_method_cache
+		} else {
+			g.array_method_cache.clone()
+		}
+		array_method_receiver_cache:        if result_only {
+			g.array_method_receiver_cache
+		} else {
+			clone_array_method_receiver_cache(g.array_method_receiver_cache)
+		}
+		param_types_cache:                  if result_only {
+			g.param_types_cache
+		} else {
+			g.param_types_cache.clone()
+		}
+		interface_receiver_cache:           &TypeNameLookupCache{}
+		normalize_call_cache:               &ContextStringLookupCache{}
+		flattened_generic_name_cache:       &TypeNameLookupCache{}
+		generic_struct_context_ct_cache:    &TypeNameLookupCache{}
+		struct_cname_cache:                 &TypeNameLookupCache{}
+		unique_struct_ct_cache:             &TypeNameLookupCache{}
+		alias_method_cache:                 &AliasMethodLookupCache{}
+		import_alias_cache:                 &ContextStringLookupCache{}
+		enum_selector_cache:                &ContextSourceTypeLookupCache{}
+		enum_method_cache:                  &ContextStringLookupCache{}
+		qualified_enum_method_cache:        &ContextStringLookupCache{}
+		import_type_cache:                  &ImportTypeCache{}
+		struct_decl_pref_cache:             &StructDeclPrefCache{}
+		struct_field_index_base:            g.struct_field_index_base
+		type_name_short_index:              g.type_name_short_index
+		qualified_struct_c_types_by_suffix: g.qualified_struct_c_types_by_suffix
+		qualified_struct_c_types_ready:     g.qualified_struct_c_types_ready
+		embedded_fields_by_type:            g.embedded_fields_by_type
+		param_types_by_short:               g.param_types_by_short
+		generic_method_candidates:          g.generic_method_candidates
+		spawn_wrapper_names:                g.spawn_wrapper_names.clone()
+		spawn_wrapper_defs:                 g.spawn_wrapper_defs.clone()
+		spawn_wrapper_defs_seen:            g.spawn_wrapper_defs_seen.clone()
+		callback_wrapper_names:             g.callback_wrapper_names.clone()
+		callback_wrapper_defs:              g.callback_wrapper_defs.clone()
+		callback_wrapper_defs_seen:         g.callback_wrapper_defs_seen.clone()
+		callback_identity_used:             g.callback_identity_used
+		callback_target_overrides:          map[int]string{}
+		// Body generation only reads the collected refs once they are complete.
+		c_extern_refs:                      if g.c_extern_refs_ready {
+			g.c_extern_refs
+		} else {
+			g.c_extern_refs.clone()
+		}
+		c_extern_refs_ready:                g.c_extern_refs_ready
+		c_extern_refs_shared:               g.c_extern_refs_ready
+		scope_parallel_workers:             g.scope_parallel_workers
+		c_name_cache:                       &CNameCache{
+			base: if !isnil(g.c_name_cache.base) { g.c_name_cache.base } else { g.c_name_cache }
+		}
+		// The master freezes the const short-name index before forking workers;
+		// sharing the read-only index avoids a rebuild per worker.
+		const_short_index:                  g.const_short_index
+		mut_recv_facts:                     &FnNameFactCache{}
+		local_typedef_shadow_facts:         &FnNameFactCache{}
+		local_global_shadow_facts:          &ContextNameFactCache{}
+		local_global_suffix_names:          g.local_global_suffix_names
+		local_global_suffix_names_ready:    g.local_global_suffix_names_ready
+		local_global_suffix_len_bits:       g.local_global_suffix_len_bits
+		local_name_exceptions:              g.local_name_exceptions
+		c_typedef_shadow_names:             g.c_typedef_shadow_names
+		c_typedef_shadow_names_ready:       g.c_typedef_shadow_names_ready
+		c_typedef_shadow_len_bits:          g.c_typedef_shadow_len_bits
+		generic_app_cache:                  &GenericAppCache{
+			base: if !isnil(g.generic_app_cache.base) {
+				g.generic_app_cache.base
+			} else {
+				g.generic_app_cache
+			}
+		}
+	}
+	if !g.lean_parallel_worker_init {
+		w.ierror_stack_pointer_aliases = []map[string]bool{}
+		w.ierror_owned_pointer_by_owner = map[string]bool{}
+		w.local_pointer_storage_by_owner = map[string]bool{}
+		w.local_c_type_by_owner = flat.TypeTextBindings{}
+		w.local_raw_type_by_owner = flat.TypeTextBindings{}
+		w.local_indirect_value_by_owner = map[string]types.Type{}
+		w.local_implicit_deref_by_owner = map[string]bool{}
+		w.local_shared_storage_by_owner = map[string]bool{}
+		w.local_fn_value_c_name_by_owner = map[string]string{}
+		w.default_value_stack = map[u32]bool{}
+		w.loop_label_depths = map[string]int{}
+		w.loop_defer_starts = []int{}
+		w.loop_label_defer_starts = map[string]int{}
+		w.goto_label_c_names = map[string]string{}
+	}
+	return w
+}
+
+fn (g &FlatGen) clone_parallel_type_checker_legacy() &types.TypeChecker {
+	// Cgen only reads file-level bindings. Give each worker an empty child scope
+	// over the immutable checked scope instead of cloning the full symbol table.
+	fs := types.new_scope(g.tc.file_scope)
+	mut wtc := &types.TypeChecker{
+		a:                                     unsafe { g.tc.a }
+		fast_parse_recent:                     g.tc.fast_parse_recent
+		fast_type_text_refs:                   g.tc.fast_type_text_refs
+		fast_c_type_recent:                    g.tc.fast_c_type_recent
+		memo_call_info:                        g.tc.memo_call_info
+		fn_ret_types:                          g.tc.fn_ret_types
+		fn_param_types:                        g.tc.fn_param_types
+		c_fn_module_ret_types:                 g.tc.c_fn_module_ret_types
+		c_fn_module_param_types:               g.tc.c_fn_module_param_types
+		c_fn_referenced_types:                 g.tc.c_fn_referenced_types
+		c_fn_module_variadic:                  g.tc.c_fn_module_variadic
+		fn_ret_type_texts:                     g.tc.fn_ret_type_texts
+		fn_param_type_texts:                   g.tc.fn_param_type_texts
+		fn_type_files:                         g.tc.fn_type_files
+		fn_type_modules:                       g.tc.fn_type_modules
+		fn_generic_params:                     g.tc.fn_generic_params
+		specialized_generic_fns:               g.tc.specialized_generic_fns
+		fn_variadic:                           g.tc.fn_variadic
+		fn_implicit_veb_ctx:                   g.tc.fn_implicit_veb_ctx
+		c_variadic_fns:                        g.tc.c_variadic_fns
+		structs:                               g.tc.structs
+		struct_modules:                        g.tc.struct_modules
+		struct_files:                          g.tc.struct_files
+		soa_structs:                           g.tc.soa_structs
+		struct_error_embeds_shadow_builtin:    g.tc.struct_error_embeds_shadow_builtin
+		struct_generic_params:                 g.tc.struct_generic_params
+		struct_field_c_abi_fns:                g.tc.struct_field_c_abi_fns
+		unions:                                g.tc.unions
+		type_aliases:                          g.tc.type_aliases
+		type_alias_modules:                    g.tc.type_alias_modules
+		type_alias_generic_params:             g.tc.type_alias_generic_params
+		type_alias_c_abi_fns:                  g.tc.type_alias_c_abi_fns
+		sum_types:                             g.tc.sum_types
+		sum_generic_params:                    g.tc.sum_generic_params
+		enum_names:                            g.tc.enum_names
+		enum_fields:                           g.tc.enum_fields
+		flag_enums:                            g.tc.flag_enums
+		interface_names:                       g.tc.interface_names
+		interface_generic_params:              g.tc.interface_generic_params
+		interface_fields:                      g.tc.interface_fields
+		interface_embeds:                      g.tc.interface_embeds
+		interface_abstract_methods:            g.tc.interface_abstract_methods
+		interface_impl_name_snapshots:         g.tc.interface_impl_name_snapshots
+		interface_impl_candidates_at_snapshot: g.tc.interface_impl_candidates_at_snapshot
+		c_globals:                             g.tc.c_globals
+		const_types:                           g.tc.const_types
+		const_exprs:                           g.tc.const_exprs
+		const_modules:                         g.tc.const_modules
+		const_files:                           g.tc.const_files
+		const_suffixes:                        g.tc.const_suffixes
+		imports:                               g.tc.imports
+		file_imports:                          g.tc.file_imports
+		selective_import_files:                g.tc.selective_import_files
+		file_modules:                          g.tc.file_modules
+		file_scope:                            g.tc.file_scope
+		cur_scope:                             fs
+		scope_pool:                            []&types.Scope{}
+		has_builtins:                          g.tc.has_builtins
+		resolution_type_mode:                  g.tc.resolution_type_mode
+		trust_checked_expr_types:              g.tc.trust_checked_expr_types
+		qualify_name_cache:                    &types.QualifyNameCache{}
+		cur_module:                            g.tc.cur_module
+		cur_file:                              g.tc.cur_file
+		errors:                                g.tc.errors.clone()
+		resolved_call_names:                   g.tc.resolved_call_names
+		resolved_call_set:                     g.tc.resolved_call_set
+		statement_nodes:                       g.tc.statement_nodes
+		expr_type_values:                      g.tc.expr_type_values
+		expr_type_set:                         g.tc.expr_type_set
+		checking_nodes:                        g.tc.checking_nodes
+		parallel_check_sparse:                 g.tc.parallel_check_sparse
+		check_range_lo:                        g.tc.check_range_lo
+		check_range_hi:                        g.tc.check_range_hi
+		sparse_resolved_call_names:            g.tc.sparse_resolved_call_names
+		sparse_resolved_fn_values:             g.tc.sparse_resolved_fn_values
+		sparse_statement_nodes:                g.tc.sparse_statement_nodes
+		sparse_expr_type_values:               g.tc.sparse_expr_type_values
+		sparse_checking_nodes:                 g.tc.sparse_checking_nodes
+		diagnose_unknown_calls:                g.tc.diagnose_unknown_calls
+		reject_unlowered_map_mutation:         g.tc.reject_unlowered_map_mutation
+		diagnostic_files:                      g.tc.diagnostic_files
+		selected_file_called_fns:              g.tc.selected_file_called_fns
+		smartcasts:                            g.tc.smartcasts
+		// Read-only map cgen uses to recover substituted signatures for generic-receiver
+		// method values (`Box[int].method` as a callback); without it a parallel worker
+		// sees an empty map and gen_method_value_closure falls through.
+		generic_method_value_info:             g.tc.generic_method_value_info
+		params_structs:                        g.tc.params_structs
+		c_typedef_structs:                     g.tc.c_typedef_structs
+	}
+	wtc.inherit_ownership_codegen_metadata_from(g.tc)
+	// A private empty TypeCache lets the worker use the lazily-built lookup
+	// indexes (short type names, local fn decls) and the field/IError
+	// memoizations instead of their uncached full-scan fallbacks. It shares no
+	// state with other threads.
+	wtc.set_fresh_type_cache_based_on(g.tc, g.tc.type_cache_parse_enabled())
+	wtc.reset_resolution_type_view_cache()
+	return wtc
+}
+
+fn (mut g FlatGen) publish_worker_string_literals(w &FlatGen) map[int]int {
+	mut remap := map[int]int{}
+	// Both tables append to the snapshot captured when this worker was forked.
+	// Only literals added since then can have conflicting ids.
+	mut common_len := w.str_lits_base_len
+	for common_len < g.str_lits.len && common_len < w.str_lits.len
+		&& g.str_lits[common_len] == w.str_lits[common_len] {
+		common_len++
+	}
+	for local_id in common_len .. w.str_lits.len {
+		literal := w.str_lits[local_id]
+		global_id := if existing_id := g.str_lit_ids[literal] {
+			existing_id
+		} else {
+			g.intern_string(literal.clone())
+		}
+		if global_id != local_id {
+			remap[local_id] = global_id
+		}
+	}
+	return remap
+}
+
+// DispatchLiteral is a string literal that a body chunk added to its dispatcher.
+struct DispatchLiteral {
+	chunk_idx int
+	order     int
+	value     string
+}
+
+// publish_dispatch_literals_in_chunk_order numbers the literals that body
+// chunks generated in chunk order, which follows the function order. Each
+// dispatcher pulls chunks from a shared queue, so merging the dispatchers one by
+// one would number them by which thread happened to take which chunk.
+fn (mut g FlatGen) publish_dispatch_literals_in_chunk_order(dispatchers []voidptr) {
+	mut literals := []DispatchLiteral{}
+	for worker_ptr in dispatchers {
+		w := unsafe { &FlatGen(worker_ptr) }
+		for i, chunk_idx in w.str_lit_chunk_indexes {
+			literals << DispatchLiteral{
+				chunk_idx: chunk_idx
+				order:     literals.len
+				value:     w.str_lits[w.str_lits_base_len + i]
+			}
+		}
+	}
+	if literals.len == 0 {
+		return
+	}
+	literals.sort_with_compare(compare_dispatch_literals)
+	for literal in literals {
+		if literal.value !in g.str_lit_ids {
+			g.intern_string(literal.value.clone())
+		}
+	}
+}
+
+fn compare_dispatch_literals(a &DispatchLiteral, b &DispatchLiteral) int {
+	if a.chunk_idx != b.chunk_idx {
+		return a.chunk_idx - b.chunk_idx
+	}
+	return a.order - b.order
+}
+
+fn remap_scoped_worker_string_symbols(source string, remap map[int]int, user_c_symbols map[string]bool) string {
+	if remap.len == 0 {
+		return source.clone()
+	}
+	mut out := strings.new_builder(source.len)
+	mut i := 0
+	for i < source.len {
+		if source[i] in [`"`, `'`] {
+			quote := source[i]
+			start := i
+			i++
+			for i < source.len {
+				if source[i] == `\\` && i + 1 < source.len {
+					i += 2
+					continue
+				}
+				i++
+				if source[i - 1] == quote {
+					break
+				}
+			}
+			out.write_string(source[start..i])
+			continue
+		}
+		if i + 1 < source.len && source[i] == `/` && source[i + 1] == `/` {
+			start := i
+			i += 2
+			for i < source.len && source[i] != `\n` {
+				i++
+			}
+			out.write_string(source[start..i])
+			continue
+		}
+		if i + 1 < source.len && source[i] == `/` && source[i + 1] == `*` {
+			start := i
+			i += 2
+			for i + 1 < source.len && !(source[i] == `*` && source[i + 1] == `/`) {
+				i++
+			}
+			if i + 1 < source.len {
+				i += 2
+			} else {
+				i = source.len
+			}
+			out.write_string(source[start..i])
+			continue
+		}
+		if c_identifier_start(source[i]) {
+			start := i
+			i++
+			for i < source.len && c_identifier_continue(source[i]) {
+				i++
+			}
+			identifier := source[start..i]
+			if cache_numbered_string_symbol(identifier) && !user_c_symbols[identifier] {
+				mut local_id := 0
+				for digit in identifier[5..].bytes() {
+					local_id = local_id * 10 + int(digit - `0`)
+				}
+				if global_id := remap[local_id] {
+					out.write_string('_str_${global_id}')
+					continue
+				}
+			}
+			out.write_string(identifier)
+			continue
+		}
+		out.write_u8(source[i])
+		i++
+	}
+	return out.str()
+}
+
+// merge_parallel_worker supports merge parallel worker handling for FlatGen.
+fn (mut g FlatGen) merge_parallel_worker(w &FlatGen) {
+	mut unordered := []string{}
+	mut unordered_wrapper_defs := []ParallelChunkWrapperDefs{}
+	g.merge_parallel_worker_into(w, mut unordered, mut unordered_wrapper_defs)
+}
+
+fn (mut g FlatGen) merge_parallel_worker_ordered(w &FlatGen, mut ordered []string, mut ordered_wrapper_defs []ParallelChunkWrapperDefs) {
+	g.merge_parallel_worker_into(w, mut ordered, mut ordered_wrapper_defs)
+}
+
+fn (mut g FlatGen) merge_parallel_worker_into(w &FlatGen, mut ordered []string, mut ordered_wrapper_defs []ParallelChunkWrapperDefs) {
+	mut ww := unsafe { w }
+	if w.callback_identity_used {
+		g.callback_identity_used = true
+	}
+	if g.output_error.len == 0 && w.output_error.len > 0 {
+		g.output_error = w.output_error.clone()
+	}
+	if w.windows_entry_point_generated {
+		g.windows_entry_point_generated = true
+		g.windows_gui_entry_point = w.windows_gui_entry_point
+	}
+	string_id_remap := g.publish_worker_string_literals(w)
+	borrow_worker_segments := retain_cgen_result_scopes() && w.worker_scope != unsafe { nil } && !g.cache_stable_symbols && string_id_remap.len == 0
+	user_c_symbols := if string_id_remap.len > 0 {
+		g.cache_user_c_string_symbols()
+	} else {
+		map[string]bool{}
+	}
+	if ww.sb.len > 0 {
+		if g.cache_stable_symbols {
+			worker_output := ww.sb.str()
+			stable_output := ww.rewrite_cache_string_symbols(worker_output)
+			g.fn_segs << moved_segment(stable_output)
+			unsafe { worker_output.free() }
+		} else if string_id_remap.len > 0 {
+			worker_output := ww.sb.str()
+			g.fn_segs << remap_scoped_worker_string_symbols(worker_output, string_id_remap, user_c_symbols)
+			unsafe { worker_output.free() }
+		} else {
+			g.fn_segs << ww.sb.str()
+		}
+	}
+	// The ordered segment owns the copied output; release the worker builder.
+	unsafe { ww.sb.free() }
+	for segment_idx, segment in w.fn_segs {
+		normalized := if g.cache_stable_symbols {
+			ww.rewrite_cache_string_symbols(segment)
+		} else if string_id_remap.len > 0 {
+			remap_scoped_worker_string_symbols(segment, string_id_remap, user_c_symbols)
+		} else if borrow_worker_segments {
+			// The immutable segment already lives in this worker's retained result
+			// arena. Its lifetime now extends through final file output, so moving
+			// the string view avoids cloning the complete generated function body.
+			segment
+		} else {
+			segment.clone()
+		}
+		if ordered.len > 0 && segment_idx < w.fn_seg_chunk_indexes.len {
+			chunk_idx := w.fn_seg_chunk_indexes[segment_idx]
+			if chunk_idx >= 0 && chunk_idx < ordered.len {
+				ordered[chunk_idx] = normalized
+				continue
+			}
+		}
+		g.fn_segs << moved_segment(normalized)
+	}
+	if g.cache_split {
+		for literal in w.str_lits {
+			g.intern_string(literal.clone())
+		}
+	}
+	for opt_name, val_type_id in w.needed_optional_types.ids {
+		g.needed_optional_types.set_id(opt_name.clone(), val_type_id)
+	}
+	for opt_name, val_type in w.optional_pointer_struct_tags {
+		g.optional_pointer_struct_tags[opt_name.clone()] = val_type.clone()
+	}
+	for encoded, name in w.fn_ptr_types {
+		if encoded !in g.fn_ptr_types {
+			g.fn_ptr_types[encoded.clone()] = name.clone()
+		}
+	}
+	for encoded, used in w.used_fn_ptr_types {
+		if used {
+			g.used_fn_ptr_types[encoded.clone()] = true
+		}
+	}
+	if !w.c_extern_refs_shared {
+		for name, used in w.c_extern_refs {
+			if used {
+				g.c_extern_refs[name.clone()] = true
+			}
+		}
+	}
+	if w.needs_thread_runtime {
+		g.needs_thread_runtime = true
+	}
+	if w.needs_pthread_header {
+		g.needs_pthread_header = true
+	}
+	if w.needs_thread_type {
+		g.needs_thread_type = true
+	}
+	for name, enabled in w.libc_compat_fns {
+		if enabled {
+			g.libc_compat_fns[name.clone()] = true
+		}
+	}
+	// Spawn wrappers (thread arg structs + trampoline fns) are generated on demand
+	// inside fn bodies, so a worker that emits a `spawn` produces wrapper defs the
+	// master must also emit. Deduplicate by their deterministic key/def.
+	for key, name in w.spawn_wrapper_names {
+		if key !in g.spawn_wrapper_names {
+			g.spawn_wrapper_names[key.clone()] = name.clone()
+		}
+	}
+	if ordered.len > 0 {
+		for wrappers in w.parallel_chunk_wrapper_defs {
+			if wrappers.chunk_idx < 0 || wrappers.chunk_idx >= ordered_wrapper_defs.len {
+				continue
+			}
+			for def in wrappers.spawn {
+				normalized := if g.cache_stable_symbols {
+					ww.rewrite_cache_string_symbols(def)
+				} else if string_id_remap.len > 0 {
+					remap_scoped_worker_string_symbols(def, string_id_remap, user_c_symbols)
+				} else {
+					def.clone()
+				}
+				ordered_wrapper_defs[wrappers.chunk_idx].spawn << normalized
+			}
+		}
+	} else {
+		for def in w.spawn_wrapper_defs {
+			if g.cache_stable_symbols {
+				g.add_spawn_wrapper_def(ww.rewrite_cache_string_symbols(def))
+			} else if string_id_remap.len > 0 {
+				g.add_spawn_wrapper_def(remap_scoped_worker_string_symbols(def, string_id_remap, user_c_symbols))
+			} else {
+				g.add_spawn_wrapper_def(def.clone())
+			}
+		}
+	}
+	for key, name in w.callback_wrapper_names {
+		if key !in g.callback_wrapper_names {
+			g.callback_wrapper_names[key.clone()] = name.clone()
+		}
+	}
+	if ordered.len > 0 {
+		for wrappers in w.parallel_chunk_wrapper_defs {
+			if wrappers.chunk_idx < 0 || wrappers.chunk_idx >= ordered_wrapper_defs.len {
+				continue
+			}
+			for def in wrappers.callback {
+				normalized := if g.cache_stable_symbols {
+					ww.rewrite_cache_string_symbols(def)
+				} else if string_id_remap.len > 0 {
+					remap_scoped_worker_string_symbols(def, string_id_remap, user_c_symbols)
+				} else {
+					def.clone()
+				}
+				ordered_wrapper_defs[wrappers.chunk_idx].callback << normalized
+			}
+		}
+	} else {
+		for def in w.callback_wrapper_defs {
+			if g.cache_stable_symbols {
+				g.add_callback_wrapper_def(ww.rewrite_cache_string_symbols(def))
+			} else if string_id_remap.len > 0 {
+				g.add_callback_wrapper_def(remap_scoped_worker_string_symbols(def, string_id_remap, user_c_symbols))
+			} else {
+				g.add_callback_wrapper_def(def.clone())
+			}
+		}
+	}
+}
+
+// retain_cgen_result_scopes reports whether joined worker result arenas stay
+// alive until the output is written, so that the merge can move their function
+// segments instead of copying the whole generated C. The arenas are released
+// after cgen, off its critical path; V3_FREE_CGEN_RESULT_SCOPES frees them at
+// the merge instead.
+fn retain_cgen_result_scopes() bool {
+	return os.getenv('V3_FREE_CGEN_RESULT_SCOPES') == ''
+}
+
+// finish_parallel_worker_scope either releases a joined result arena
+// immediately (oracle fallback) or retains it until FlatGen has written every
+// borrowed function segment.
+fn (mut g FlatGen) finish_parallel_worker_scope(mut w FlatGen) {
+	if w.worker_scope == unsafe { nil } {
+		return
+	}
+	if retain_cgen_result_scopes() {
+		g.parallel_worker_scopes << w.worker_scope
+	} else {
+		cgen_worker_scope_free(w.worker_scope)
+	}
+	w.worker_scope = unsafe { nil }
+}
+
+fn (mut g FlatGen) replay_ordered_parallel_wrapper_defs(wrapper_defs []ParallelChunkWrapperDefs) {
+	for wrappers in wrapper_defs {
+		for def in wrappers.spawn {
+			g.add_spawn_wrapper_def(def)
+		}
+		for def in wrappers.callback {
+			g.add_callback_wrapper_def(def)
+		}
+	}
+}
+
+// run_pre_dispatch_parallel overlaps the serial pre-dispatch work: the
+// fixed-storage-const scan runs on a helper thread while the master collects
+// the fn work items and pre-seeds the string/fn-ptr tables the workers need.
+// Returns false when the parallel path is not applicable (the caller then
+// runs the serial order).
+fn (mut g FlatGen) run_pre_dispatch_parallel(no_parallel bool) bool {
+	if no_parallel {
+		return false
+	}
+	// Support workers read the warm cache while candidate replay memoizes types.
+	// Keep the master's writes in an overlay until every support worker joins.
+	g.tc.freeze_type_cache_for_forks()
+	defer { g.tc.discard_type_cache_overlay_after_forks() }
+	if isnil(g.a.worker_pool) {
+		g.a.worker_pool = workers.new(runtime.nr_jobs() - 1)
+	}
+	mut fs_worker := g.new_parallel_worker(0)
+	fs_worker.tc.verbose = g.tc.verbose
+	// These helpers resolve C names and generic applications concurrently with
+	// selection. Keep their mutable caches separate from the master and each other.
+	fs_worker.c_name_cache = &CNameCache{}
+	fs_worker.generic_app_cache = &GenericAppCache{}
+	mut fixed_array_worker := g.new_parallel_worker(1)
+	fixed_array_worker.tc.verbose = g.tc.verbose
+	fixed_array_worker.c_name_cache = &CNameCache{}
+	fixed_array_worker.generic_app_cache = &GenericAppCache{}
+	mut optional_worker := g.new_parallel_worker(2)
+	optional_worker.tc.verbose = g.tc.verbose
+	optional_worker.c_name_cache = &CNameCache{}
+	optional_worker.generic_app_cache = &GenericAppCache{}
+	mut call_optional_worker := g.new_parallel_worker(3)
+	call_optional_worker.tc.verbose = g.tc.verbose
+	call_optional_worker.c_name_cache = &CNameCache{}
+	call_optional_worker.generic_app_cache = &GenericAppCache{}
+	fail := os.getenv('V3_TEST_PTHREAD_CREATE_FAIL')
+	if fail.len > 0 {
+		// prepare_pre_dispatch_master can submit its own selection/cost batches to
+		// this pool. Do not run it as the caller-side task of an outer Pool.run:
+		// the untagged completion channel would let the nested batch consume the
+		// support tasks' completions and return while its payloads are still live.
+		g.prepare_pre_dispatch_master()
+		optional_worker.fn_gen_items = g.fn_gen_items.clone()
+		g.a.worker_pool.run([
+			workers.Task{
+				run:        fixed_storage_scan_thread
+				arg:        voidptr(fs_worker)
+				force_sync: fail == 'cgen:all' || fail == 'cgen:pre:all' || fail == 'cgen:pre:0'
+			},
+			workers.Task{
+				run:        fixed_array_support_thread
+				arg:        voidptr(fixed_array_worker)
+				force_sync: fail == 'cgen:all' || fail == 'cgen:pre:all'
+			},
+			workers.Task{
+				run:        optional_support_thread
+				arg:        voidptr(optional_worker)
+				force_sync: fail == 'cgen:all' || fail == 'cgen:pre:all'
+			},
+			workers.Task{
+				run:        unresolved_call_optional_thread
+				arg:        voidptr(call_optional_worker)
+				force_sync: fail == 'cgen:all' || fail == 'cgen:pre:all'
+			},
+		])
+		g.refine_fn_item_costs(no_parallel, false)
+		g.precompute_param_type_index()
+	} else {
+		// Item selection only reads the AST and immutable checker tables, so let
+		// its exact-cost pass use the otherwise-idle pool while the independent
+		// fixed-storage scan finishes on a helper thread.
+		mut psw := time.new_stopwatch()
+		// The master swaps in a selection checker meanwhile; keep the checked one.
+		mut field_index_args := &ParamTypeIndexArgs{
+			g:  g
+			tc: g.tc
+		}
+		field_index_thread := spawn param_type_index_thread(voidptr(field_index_args))
+		// The fixed-array return wrapper scans only read the collected declaration
+		// tables; run them beside the other lanes from the start.
+		overlap_wrappers := os.getenv('V3_NO_PAR_FIXED_RET') == ''
+		mut wrapper_workers := []&FlatGen{}
+		mut wrapper_threads := []thread voidptr{}
+		if overlap_wrappers {
+			wrapper_workers, wrapper_threads = g.start_fixed_array_ret_wrappers()
+		}
+		fixed_storage_thread := spawn fixed_storage_scan_thread(voidptr(fs_worker))
+		fixed_array_thread := spawn fixed_array_support_thread(voidptr(fixed_array_worker))
+		call_optional_thread := spawn unresolved_call_optional_thread(voidptr(call_optional_worker))
+		selection_args := OptionalSelectionArgs{
+			worker: voidptr(optional_worker)
+			items:  chan []FlatFnGenItem{cap: 1}
+		}
+		optional_thread := spawn optional_support_selection_thread(voidptr(&selection_args))
+		g.prepare_pre_dispatch_master()
+		// Reuse the selected declarations instead of selecting every function
+		// again on the optional-support thread. Cost refinement writes the
+		// master's item array, so the helper needs its own snapshot.
+		selection_args.items <- g.fn_gen_items.clone()
+		g.timing_profile('  [ttime]     cg prep master ${f64(psw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+		psw.restart()
+		g.refine_fn_item_costs(no_parallel, true)
+		g.timing_profile('  [ttime]     cg cost refine ${f64(psw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+		psw.restart()
+		// The master would only wait for the helper lanes now. Build the shared
+		// and sum indexes and the fixed-array return wrappers meanwhile: they
+		// only read the collected declaration tables, and dispatch needs them next.
+		if overlap_wrappers {
+			g.collect_shared_type_names()
+			g.precompute_sum_name_lookup()
+			g.timing_profile('  [ttime]     wr shared+sum  ${f64(psw.elapsed().microseconds()) / 1000.0:7.2f} ms (overlapped)')
+			psw.restart()
+		}
+		_ = fixed_storage_thread.wait()
+		_ = fixed_array_thread.wait()
+		_ = optional_thread.wait()
+		_ = call_optional_thread.wait()
+		_ = field_index_thread.wait()
+		g.param_types_by_short = field_index_args.param_types_by_short.move()
+		if field_index_args.scope != unsafe { nil } {
+			g.parallel_worker_scopes << field_index_args.scope
+		}
+		g.timing_profile('  [ttime]     cg fs wait     ${f64(psw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+		if overlap_wrappers {
+			psw.restart()
+			// The generic method index is cleared and filled in place, so build it
+			// only once the helper lanes, which share its storage, have finished.
+			if !g.skip_generics {
+				g.precompute_generic_method_candidate_index()
+			}
+			g.finish_fixed_array_ret_wrappers(mut wrapper_workers, wrapper_threads)
+			g.timing_profile('  [ttime]     wr fixed ret   ${f64(psw.elapsed().microseconds()) / 1000.0:7.2f} ms (overlapped)')
+		}
+	}
+	g.publish_fixed_storage_scan(mut fs_worker)
+	g.publish_fixed_array_support(mut fixed_array_worker)
+	g.publish_optional_support(mut optional_worker)
+	g.publish_unresolved_call_optional_types(mut call_optional_worker)
+	if g.parallel_prepared && !g.prep_externs_pending {
+		// Item-body and top-level C-extern refs are fully collected (fused
+		// prep + exact-cost pass or its serial fallback); the pre-dispatch
+		// preseed can reuse them instead of re-walking every selected body.
+		g.c_extern_refs_ready = true
+	}
+	return true
+}

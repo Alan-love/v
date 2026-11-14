@@ -1,0 +1,240 @@
+// Copyright (c) 2019-2024 Alexander Medvednikov. All rights reserved.
+// Use of this source code is governed by an MIT license
+// that can be found in the LICENSE file.
+module bits
+
+fn C.__builtin_clz(x u32) i32
+fn C.__builtin_clzll(x u64) i32
+fn C._BitScanReverse(pos &int, x u32) u8
+fn C._BitScanReverse64(pos &int, x u64) u8
+
+// leading_zeros_8 returns the number of leading zero bits in x; the result is 8 for x == 0.
+@[inline]
+pub fn leading_zeros_8(x u8) int {
+	if x == 0 {
+		return 8
+	}
+	$if msvc {
+		mut pos := 0
+		_ := C._BitScanReverse(&pos, u32(x))
+		return 7 - pos
+	} $else $if !tinyc {
+		return C.__builtin_clz(u32(x)) - 24
+	}
+	return leading_zeros_8_default(x)
+}
+
+// leading_zeros_16 returns the number of leading zero bits in x; the result is 16 for x == 0.
+@[inline]
+pub fn leading_zeros_16(x u16) int {
+	if x == 0 {
+		return 16
+	}
+	$if msvc {
+		mut pos := 0
+		_ := C._BitScanReverse(&pos, u32(x))
+		return 15 - pos
+	} $else $if !tinyc {
+		return C.__builtin_clz(u32(x)) - 16
+	}
+	return leading_zeros_16_default(x)
+}
+
+// leading_zeros_32 returns the number of leading zero bits in x; the result is 32 for x == 0.
+@[inline]
+pub fn leading_zeros_32(x u32) int {
+	if x == 0 {
+		return 32
+	}
+	$if msvc {
+		mut pos := 0
+		_ := C._BitScanReverse(&pos, x)
+		return 31 - pos
+	} $else $if !tinyc {
+		return C.__builtin_clz(x)
+	}
+	return leading_zeros_32_default(x)
+}
+
+// leading_zeros_64 returns the number of leading zero bits in x; the result is 64 for x == 0.
+@[inline]
+pub fn leading_zeros_64(x u64) int {
+	if x == 0 {
+		return 64
+	}
+	$if msvc {
+		mut pos := 0
+		_ := C._BitScanReverse64(&pos, x)
+		return 63 - pos
+	} $else $if !tinyc {
+		return C.__builtin_clzll(x)
+	}
+	return leading_zeros_64_default(x)
+}
+
+// --- Len ---
+// len_16 returns the minimum number of bits required to represent x; the result is 0 for x == 0.
+@[inline]
+pub fn len_16(x u16) int {
+	if x == 0 {
+		return 0
+	}
+	$if msvc {
+		mut pos := 0
+		_ := C._BitScanReverse(&pos, u32(x))
+		return pos + 1
+	} $else $if !tinyc {
+		return 32 - C.__builtin_clz(u32(x))
+	}
+	return len_16_default(x)
+}
+
+// len_32 returns the minimum number of bits required to represent x; the result is 0 for x == 0.
+@[inline]
+pub fn len_32(x u32) int {
+	if x == 0 {
+		return 0
+	}
+	$if msvc {
+		mut pos := 0
+		_ := C._BitScanReverse(&pos, x)
+		return pos + 1
+	} $else $if !tinyc {
+		return 32 - C.__builtin_clz(x)
+	}
+	return len_32_default(x)
+}
+
+// len_64 returns the minimum number of bits required to represent x; the result is 0 for x == 0.
+@[inline]
+pub fn len_64(x u64) int {
+	if x == 0 {
+		return 0
+	}
+	$if msvc {
+		mut pos := 0
+		_ := C._BitScanReverse64(&pos, x)
+		return pos + 1
+	} $else $if !tinyc {
+		return 64 - C.__builtin_clzll(x)
+	}
+	return len_64_default(x)
+}
+
+fn C.__builtin_ctz(x u32) i32
+fn C.__builtin_ctzll(x u64) i32
+fn C._BitScanForward(pos &int, x u32) u8
+fn C._BitScanForward64(pos &int, x u64) u8
+
+// trailing_zeros_8 returns the number of trailing zero bits in x; the result is 8 for x == 0.
+@[inline]
+pub fn trailing_zeros_8(x u8) int {
+	if x == 0 {
+		return 8
+	}
+	$if msvc {
+		mut pos := 0
+		_ := C._BitScanForward(&pos, u32(x))
+		return pos
+	} $else $if !tinyc {
+		return C.__builtin_ctz(u32(x))
+	}
+	return trailing_zeros_8_default(x)
+}
+
+// trailing_zeros_16 returns the number of trailing zero bits in x; the result is 16 for x == 0.
+@[inline]
+pub fn trailing_zeros_16(x u16) int {
+	if x == 0 {
+		return 16
+	}
+	$if msvc {
+		mut pos := 0
+		_ := C._BitScanForward(&pos, u32(x))
+		return pos
+	} $else $if !tinyc {
+		return C.__builtin_ctz(u32(x))
+	}
+	return trailing_zeros_16_default(x)
+}
+
+// trailing_zeros_32 returns the number of trailing zero bits in x; the result is 32 for x == 0.
+@[inline]
+pub fn trailing_zeros_32(x u32) int {
+	if x == 0 {
+		return 32
+	}
+	$if msvc {
+		mut pos := 0
+		_ := C._BitScanForward(&pos, x)
+		return pos
+	} $else $if !tinyc {
+		return C.__builtin_ctz(x)
+	}
+	return trailing_zeros_32_default(x)
+}
+
+// trailing_zeros_64 returns the number of trailing zero bits in x; the result is 64 for x == 0.
+@[inline]
+pub fn trailing_zeros_64(x u64) int {
+	if x == 0 {
+		return 64
+	}
+	$if msvc {
+		mut pos := 0
+		_ := C._BitScanForward64(&pos, x)
+		return pos
+	} $else $if !tinyc {
+		return C.__builtin_ctzll(x)
+	}
+	return trailing_zeros_64_default(x)
+}
+
+fn C.__builtin_popcount(x u32) i32
+fn C.__builtin_popcountll(x u64) i32
+fn C.__popcnt(x u32) i32
+fn C.__popcnt64(x u64) i32
+
+// ones_count_8 returns the number of one bits ("population count") in x.
+@[inline]
+pub fn ones_count_8(x u8) int {
+	$if msvc {
+		return C.__popcnt(u32(x))
+	} $else $if !tinyc {
+		return C.__builtin_popcount(u32(x))
+	}
+	return ones_count_8_default(x)
+}
+
+// ones_count_16 returns the number of one bits ("population count") in x.
+@[inline]
+pub fn ones_count_16(x u16) int {
+	$if msvc {
+		return C.__popcnt(u32(x))
+	} $else $if !tinyc {
+		return C.__builtin_popcount(u32(x))
+	}
+	return ones_count_16_default(x)
+}
+
+// ones_count_32 returns the number of one bits ("population count") in x.
+@[inline]
+pub fn ones_count_32(x u32) int {
+	$if msvc {
+		return C.__popcnt(x)
+	} $else $if !tinyc {
+		return C.__builtin_popcount(x)
+	}
+	return ones_count_32_default(x)
+}
+
+// ones_count_64 returns the number of one bits ("population count") in x.
+@[inline]
+pub fn ones_count_64(x u64) int {
+	$if msvc {
+		return C.__popcnt64(x)
+	} $else $if !tinyc {
+		return C.__builtin_popcountll(x)
+	}
+	return ones_count_64_default(x)
+}

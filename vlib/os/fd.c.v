@@ -1,32 +1,63 @@
 module os
 
-// file descriptor based operations:
+// low level operations with file descriptors/handles
 
-// close filedescriptor
+$if windows {
+	#include <winsock2.h>
+}
+
+#flag windows -lws2_32
+
+// fd_close closes the file descriptor. It returns 0 on success.
 pub fn fd_close(fd int) int {
 	if fd == -1 {
 		return 0
 	}
-	return C.close(fd)
+	$if freestanding || syscalls {
+		return bf_close(fd)
+	}
+	$if !freestanding && !syscalls {
+		return C.close(fd)
+	}
 }
 
+// fd_write writes the given string to the file descriptor.
+// It blocks until all the data in the string is written.
 pub fn fd_write(fd int, s string) {
 	if fd == -1 {
 		return
 	}
-	mut sp := s.str
-	mut remaining := s.len
-	for remaining > 0 {
-		written := C.write(fd, sp, remaining)
-		if written < 0 {
-			return
+	$if freestanding || syscalls {
+		mut sp_fs := s.str
+		mut remaining_fs := s.len
+		for remaining_fs > 0 {
+			written, we := bf_write(fd, sp_fs, remaining_fs)
+			if we == 4 { // EINTR
+				continue
+			}
+			if we != 0 || written == 0 {
+				return
+			}
+			remaining_fs = remaining_fs - written
+			sp_fs = unsafe { voidptr(uint(sp_fs) + uint(written)) }
 		}
-		remaining = remaining - written
-		sp = unsafe { sp + written }
+		return
+	}
+	$if !freestanding && !syscalls {
+		mut sp := s.str
+		mut remaining := s.len
+		for remaining > 0 {
+			written := int(C.write(fd, sp, remaining))
+			if written < 0 {
+				return
+			}
+			remaining = remaining - written
+			sp = unsafe { voidptr(uint(sp) + uint(written)) }
+		}
 	}
 }
 
-// read from filedescriptor, block until data
+// fd_slurp reads all the remaining data from the file descriptor.
 pub fn fd_slurp(fd int) []string {
 	mut res := []string{}
 	if fd == -1 {
@@ -42,20 +73,144 @@ pub fn fd_slurp(fd int) []string {
 	return res
 }
 
-// read from filedescriptor, don't block
-// return [bytestring,nrbytes]
+// fd_read reads data from the file descriptor. It returns the read data, and how many bytes were read.
+// On signal interruption (EINTR), the read is retried so callers do not see spurious empty results
+// when a signal (for example a Boehm GC stop-the-world signal in a multi-threaded program) interrupts
+// a blocking read.
 pub fn fd_read(fd int, maxbytes int) (string, int) {
 	if fd == -1 {
 		return '', 0
 	}
 	unsafe {
-		mut buf := malloc_noscan(maxbytes + 1)
-		nbytes := C.read(fd, buf, maxbytes)
-		if nbytes < 0 {
-			free(buf)
-			return '', nbytes
+		$if freestanding || syscalls {
+			mut buf := malloc_noscan(maxbytes + 1)
+			nr, re := bf_read(fd, buf, maxbytes)
+			for re == 4 { // EINTR
+				nr, re = bf_read(fd, buf, maxbytes)
+			}
+			if re != 0 || nr < 0 {
+				free(buf)
+				return '', re
+			}
+			if nr == 0 {
+				free(buf)
+				return '', 0
+			}
+			buf[nr] = 0
+			return tos(buf, nr), nr
 		}
-		buf[nbytes] = 0
-		return tos(buf, nbytes), nbytes
+		$if !freestanding && !syscalls {
+			mut buf := malloc_noscan(maxbytes + 1)
+			mut nbytes := 0
+			for {
+				$if !windows {
+					C.errno = 0
+				}
+				nbytes = int(C.read(fd, buf, maxbytes))
+				if nbytes >= 0 {
+					break
+				}
+				$if !windows {
+					if C.errno == C.EINTR {
+						continue
+					}
+				}
+				break
+			}
+			if nbytes < 0 {
+				free(buf)
+				return '', nbytes
+			}
+			buf[nbytes] = 0
+			return tos(buf, nbytes), nbytes
+		}
+	}
+}
+
+@[typedef]
+pub struct C.fd_set {}
+
+pub struct C.timeval {
+pub:
+	tv_sec  u64
+	tv_usec u64
+}
+
+fn C.select(ndfs i32, readfds &C.fd_set, writefds &C.fd_set, exceptfds &C.fd_set, timeout &C.timeval) i32
+
+$if !windows {
+	fn C.ioctl(fd i32, request u64, args ...voidptr) i32
+}
+
+$if windows {
+	fn C._get_osfhandle(fd int) voidptr
+	fn C.PeekNamedPipe(hNamedPipe voidptr, lpBuffer voidptr, nBufferSize i32, lpBytesRead voidptr, lpTotalBytesAvail voidptr, lpBytesLeftThisMessage voidptr) bool
+}
+
+// These are C macros, but from the V's point of view, can be treated as C functions:
+fn C.FD_ZERO(fdset &C.fd_set)
+fn C.FD_SET(fd i32, fdset &C.fd_set)
+fn C.FD_ISSET(fd i32, fdset &C.fd_set) i32
+
+$if !windows && !freestanding && !syscalls {
+	#include "@DIR/fd_poll.h"
+	fn C.v_os_fd_poll_revents(fd i32, events i16) i16
+}
+
+$if !windows && !freestanding && !syscalls {
+	fn fd_is_pending_poll(fd int) bool {
+		revents := C.v_os_fd_poll_revents(i32(fd), i16(C.POLLIN))
+		if (revents & i16(C.POLLNVAL)) != 0 {
+			return false
+		}
+		return (revents & i16(C.POLLIN | C.POLLHUP | C.POLLERR)) != 0
+	}
+}
+
+// fd_is_pending returns true, when there is pending data, waiting to be read from file descriptor `fd`.
+// If the file descriptor is closed, or if reading from it, will block (there is no data), fd_is_pending returns false.
+pub fn fd_is_pending(fd int) bool {
+	if fd < 0 {
+		return false
+	}
+	mut bytes_avail := int(0)
+	$if freestanding || syscalls {
+		// FIONREAD answers directly; there is no select-based fallback for
+		// fds that dislike the ioctl. The request code is per OS: linux
+		// 0x541B, BSD/Darwin 0x4004667f.
+		request := $if linux ? { u64(0x541B) } $else { u64(0x4004667f) }
+		ic := fsys_ioctl(fd, request, &bytes_avail)
+		return ic == 0 && bytes_avail > 0
+	}
+	$if !freestanding && !syscalls {
+		$if windows {
+			handle := voidptr(C._get_osfhandle(fd))
+			if handle != voidptr(-1) {
+				if C.PeekNamedPipe(handle, unsafe { nil }, int(0), unsafe { nil },
+					voidptr(&bytes_avail), unsafe { nil })
+				{
+					return bytes_avail > 0
+				}
+			}
+			read_set := C.fd_set{}
+			C.FD_ZERO(&read_set)
+			C.FD_SET(fd, &read_set)
+			mut ts := C.timeval{
+				tv_sec:  0
+				tv_usec: 0
+			}
+			res := C.select(fd + 1, &read_set, unsafe { nil }, unsafe { nil }, &ts)
+			if res > 0 && C.FD_ISSET(fd, &read_set) != 0 {
+				return true
+			}
+			return false
+		} $else {
+			if C.ioctl(fd, u64(C.FIONREAD), &bytes_avail) == 0 {
+				return bytes_avail > 0
+			}
+			// poll avoids FD_SETSIZE and needs no sys/select.h include in
+			// headerless cross-generated C on Darwin.
+			return fd_is_pending_poll(fd)
+		}
 	}
 }

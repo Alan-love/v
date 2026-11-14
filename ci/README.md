@@ -1,0 +1,255 @@
+# Local CI runners
+
+## Running Windows CI on an installed VM
+
+From a built Windows checkout with PowerShell 7.4 or newer (`pwsh`) and the workflow's
+dependencies installed, run a compiler's validation sequence or a single step:
+
+```powershell
+./v.exe run ci/windows_ci.vsh tcc list
+./v.exe run ci/windows_ci.vsh tcc self_tests
+./v.exe run ci/windows_ci.vsh tcc ci
+```
+
+Use `gcc` or `msvc` in place of `tcc` for the other compiler lanes. MSVC requires
+a developer shell with `cl.exe` and the Windows SDK on PATH. The runner reads each
+step's commands and environment directly from `.github/workflows/windows_ci_*.yml`.
+It uses this checkout's compiler, disables compatibility fallback, sets fail-fast,
+and preserves an explicitly set `VJOBS` for smaller VMs. It also runs the workflow's
+private cache setup and imports `GITHUB_ENV` and `GITHUB_PATH` changes between steps.
+
+The sequence starts after bootstrap and dependency provisioning. Install those
+prerequisites before running it. Hosted MSYS2 graphics steps and the separate
+multiwindow jobs remain in GitHub Actions. Use `list` to see the local selection;
+it is also available on other operating systems. A failed step stops the sequence.
+Repeat its step ID to retry it. To focus a self-test run on an existing failure:
+
+```powershell
+$env:VTEST_ONLY = 'goroutines_windows_test.v,legacy_json_edge_cases_test.v'
+./v.exe run ci/windows_ci.vsh tcc self_tests
+Remove-Item Env:VTEST_ONLY
+```
+
+Selecting `msvc multiwindow_d3d11_warp_regressions_and_runtime_probes` also runs
+`prepare_multiwindow_job_object_watchdog` first, rebuilding the generated helper
+needed by the probe. The complete `msvc ci` sequence already includes it in workflow order.
+
+Test the runner and workflow selection with `./v.exe test ci/windows/`. On Windows,
+this executes real PowerShell subprocesses to check compiler selection, environment
+propagation, quoting, and failure handling.
+
+## Resuming the Linux CI jobs
+
+From the repository root of a built checkout on Linux, run:
+
+```sh
+./v run ci/linux_ci.vsh ci
+```
+
+This runs the script tasks from `.github/workflows/linux_ci.yml` in workflow order:
+TCC, GCC, then Clang. It does not bootstrap V or run the workflow's separate shell
+canaries. The tasks include dependency installation with `sudo apt`; Ubuntu 24.04
+and Debian 13 are supported, with all three C compilers available. Wayland uses
+the runtime package `libwayland-egl1`. The wkhtmltox C interop library uses the
+guest's Debian package architecture, with the Jammy build on Ubuntu and the
+Bookworm build on Debian. Its dependencies are installed through APT.
+The dependency tasks also install Node.js for the WebAssembly runtime tests.
+Native C++ objects use the platform C++ compiler for headers. On Linux, TinyCC
+links also search that compiler's C++ runtime directory, including Debian's
+versioned GCC library directory.
+The command selects each lane explicitly (`-cc tcc -no-retry-compilation` for TCC,
+`-cc gcc` for GCC, and `-cc clang` for Clang), sets the
+corresponding `GITHUB_JOB`, and disables the compatibility compiler fallback.
+Explicit GCC selection prevents the installed TinyCC from becoming the GCC lane's default.
+
+The ARM64 fixtures using `cmp` or raw SIMD run with GCC or Clang; TCC's assembler
+does not support those instructions and NEON register clobbers. Linux builds
+enable the ARMv8 crypto assembler extension, while the PMULL runtime test still
+checks the host CPU's capabilities. Generic bool assembly uses byte loads and
+stores, with a guard checking that adjacent bytes remain unchanged.
+
+Like the macOS runner, it saves the current task **before** executing it and sets
+`VTEST_FAIL_FAST=1`. It retains Linux CI's normal test worker count. Fix a failure
+and repeat the command to resume that same task. Successful test files are retained
+through the shared per-test resume mechanism described below; failed, interrupted
+and not-yet-run files are retried. Non-test commands restart at the beginning of
+their task.
+
+Linux progress is stored in the user cache directory (`$XDG_CACHE_HOME`, or
+`~/.cache`) as `v-linux-ci-<uid>-<checkout-hash>.progress`, with per-test records
+in the sibling `.progress.d` directory. It is separate from macOS progress and
+from other users and checkouts. Edits and compiler rebuilds preserve progress.
+Missing or invalid cursors, changed task plans, and `--reset` discard per-test
+state as well. A complete run clears both levels of progress. Read/write errors
+stop execution instead of silently losing progress.
+
+After fixing compiler/library bugs, perform a fresh validation of earlier work with:
+
+```sh
+./v run ci/linux_ci.vsh ci --reset
+```
+
+A resumed pass alone does not revalidate earlier successes against shared source
+changes. Reset after switching branches or removing build artifacts, too. Do not run
+aggregate CI jobs concurrently in one checkout. Individual tasks and `all` retain
+their existing behavior and do not consume the aggregate runner's checkpoint.
+
+To test Linux task resume, compiler/job switching and workflow-plan parity without
+running the CI workloads or installing dependencies:
+
+```sh
+sh ci/linux_ci_resume_test.sh
+```
+
+The macOS integration test and shared resume unit test listed below also run on Linux
+and cover the unchanged per-file resume implementation. Set `VEXE` to an absolute
+compiler path to select the compiler used to build the integration-test runner.
+
+### Debian QEMU guest disk space
+
+`ci/qemu_linux_tests.sh` enables discard for the guest's QCOW2 disk. Run
+`sudo fstrim -v /` inside the guest to release unused disk blocks back to the host
+after compiler builds and test runs. Guest free space alone does not show how much
+host storage the disk image occupies. A full host disk can pause QEMU even when
+the guest filesystem has free space.
+
+Restart a guest launched before discard was enabled to apply the disk setting.
+
+## Resuming the macOS CI job
+
+From the repository root, run:
+
+```sh
+./v run ci/macos_ci.vsh ci
+```
+
+On macOS, every invocation first runs `vlib/v/util/machosign/macho_sign_test.v`
+with the workflow's compiler flags and compatibility fallback disabled. This fresh
+check runs even when resuming past `self_tests`, ignores test file/function filters,
+and does not reuse successful test records. It requires an executable TinyCC in the
+compiler checkout; run `make` to install it if missing. A signing failure stops CI
+without changing existing progress. The check covers unsigned fixture verification,
+execution after signing, strict `codesign` verification, repeated signing and shrinking.
+
+The `ci` command saves the current **CI task** before executing it. After a failure,
+fix the code and run the same command again: previously completed tasks are skipped,
+and the failed task is retried before proceeding with the remaining tasks.
+An interrupted run also retains the task it was running. A fully completed job removes
+its checkpoints, so the following invocation starts from the beginning.
+
+The aggregate `ci` command sets `VTEST_FAIL_FAST=1` and `VJOBS=1`, overriding inherited
+values. Test and example-build sessions stop at the first reported failure, with no
+other files already running in parallel. The `self_tests` task retains the explicit
+`VJOBS` setting, including the workflow's three workers and the aggregate runner's
+single worker. Without `VJOBS`, GitHub Actions self-tests use one worker when
+`VTEST_FAIL_FAST=1`, or every available CPU otherwise.
+`test-cleancode` also stops after a failed
+vetting session instead of starting formatting checks. The failed task's checkpoint
+is retained. Existing per-test retry and known-flaky-test policies are unchanged.
+
+The macOS `self_tests` task uses `/usr/bin/caffeinate` to wake the display and keep
+it awake while the tests run. Metal frame callbacks require an awake display.
+The display assertion is released when the task exits, including after a failure.
+
+Progress is stored in `/tmp/v-macos-ci-<uid>-<checkout-hash>.progress`; the command
+prints the exact path. The hash uses the canonical checkout directory, not a commit
+or source timestamp, so edits, commits and compiler rebuilds do not discard progress.
+Other users and checkouts have separate checkpoints. Missing, invalid or outdated
+checkpoint contents restart the sequence; a changed ordered task list also restarts it.
+Read/write errors stop the command rather than continuing without reliable progress.
+Writes use a private temporary directory and a same-filesystem rename.
+
+To discard saved progress and run every task:
+
+```sh
+./v run ci/macos_ci.vsh ci --reset
+```
+
+Test sessions also record each successful `_test.v`, `_test.c.v` and `_test.js.v` file.
+For example, when `self_tests` fails, the next invocation skips unchanged files that
+already passed and retries failed, interrupted and not-yet-run files. Compilation
+alone is not a pass. Skipped tests and ignored flaky failures are not recorded as
+successful. Recording is independent of the reporter and works with hidden OK output
+and `-stats`. Existing test discovery, exclusions and retry policies still apply.
+
+These records live in a sibling `<progress-path>.d` directory, separated by task,
+command, compiler options and test path. Editing a test file invalidates its saved
+success. Nested test runners do not reuse their parent's records. Reset, an invalid
+or missing task cursor, a changed task plan and successful completion clear this
+additional state too. Normal individual-task and `all` invocations remain exhaustive.
+
+`run_sanitizers` currently has two compiler commands, rather than a `_test.v` session.
+It checkpoints the successful instrumented compiler build. A retry runs the failing
+self-compilation without rebuilding `v2`, unless that binary is missing or changed.
+Other non-test commands retain their existing task-level retry behavior.
+
+On macOS, `build-examples` builds `examples/macos_tray` as a project folder so its
+platform-specific source is included alongside the main program.
+`examples/mini_software_emulator` is also built as a project folder on every platform,
+including its CPU, instruction handlers and machine state in one program.
+
+A resumed pass is not a fresh validation of earlier tasks or tests against shared
+source changes. Compiler and library edits deliberately preserve progress. Use
+`ci --reset` for a complete check, after switching branches, or after removing build
+artifacts needed by later tasks. Do not run multiple `ci` jobs in the same checkout
+concurrently; they share the checkpoint and build outputs.
+
+The macOS self-tests use default module caching. Generated cleanup for detached
+thread results must also compile with older Apple Clang versions that reject
+declarations immediately after `case` labels. The focused regression checks
+uncached, cold-cache and warm-cache builds, including nested error payloads:
+
+```sh
+./v test vlib/v/gen/c/detached_spawn_cleanup_test.v
+```
+
+When MinGW and `windres` are installed, self-tests also cross-compile Windows executables
+with icons, covering all four icon flag aliases with `-g` and `-cg`. The integer formatting
+helpers used by Windows backtraces must work with this reduced runtime. To rerun this check:
+
+```sh
+./v test vlib/v/driver/windows_icon_test.v
+```
+
+Cached module objects may call interface methods declared in a module rebuilt from source.
+Those dispatchers, their concrete methods and transitive callees must remain available when
+cached callers' bodies are absent from the reachability scan. The example build covers this
+through `net.http`, SOCKS and
+`examples/web_crawler`. The focused dispatch regression is:
+
+```sh
+./v test vlib/v/gen/c/interface_test.v
+./v test vlib/v/markused/library_frontier_test.v
+```
+
+Paths containing `-l`, including private temporary directories such as `build-logs`, must not
+be treated as library options. C flag classification checks argument boundaries and skips
+include, search-path, macro and linker-option operands. Its regression can be run with:
+
+```sh
+./v test vlib/v/gen/c/target_test.v
+```
+
+### Testing the resume behavior
+
+On macOS or Linux with a working V compiler, run:
+
+```sh
+sh ci/macos_ci_resume_test.sh
+./v test cmd/tools/testing/resume_test.v
+```
+
+Set `VEXE` to an absolute compiler path to use a different V executable. The test
+compiles the real runner, then replaces its task subprocesses through `V_CI_VEXE`
+with a small shell fixture. It tests failures, retries, successful cleanup, reset,
+invalid checkpoints, checkout isolation, checkpoint write failures and fail-fast
+environment propagation. On macOS it also checks that signing runs before every
+resume despite test filters, and that signing failures or missing TinyCC stop CI
+without advancing progress. It also compiles the real `test-cleancode` tool and runs it
+against a tiny checkout with mocked vet/fmt commands, checking both fail-fast and
+normal session sequencing. The real `v test` runner is exercised with mocked test
+compilation/execution to check per-file retries after compile and runtime failures,
+source edits, stats mode, ignored flaky failures and nested tests. Sanitizer fixtures
+check reuse and invalidation of the built compiler. Unit tests cover success-record
+validation, compiler-option isolation, file suffixes, nested-run ownership and I/O
+errors. No macOS workloads or package installations are run.

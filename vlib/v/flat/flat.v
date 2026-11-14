@@ -1,0 +1,1772 @@
+@[has_globals]
+module flat
+
+import v.token
+import v.workers
+
+// NodeId aliases node id values used by flat.
+// Node ids index `FlatAst.nodes`, so i32 is ample and keeps `children` (one entry
+// per AST edge) and every node-id side table half the size of a 64-bit `int`.
+pub type NodeId = i32
+
+// TextId is the stable identity of one canonical AST text value.
+pub type TextId = u32
+
+pub const empty_node = NodeId(-1)
+pub const method_value_borrow_receiver_marker = '__v3_method_value_borrow_receiver'
+pub const method_value_clone_receiver_marker_prefix = '__v3_method_value_clone_receiver:'
+
+// Attribute kind sidecars preserve the public kind in the low bits and distinguish a
+// whole-string key from a keyed argument after legacy attribute strings are unquoted.
+pub const attribute_kind_mask = 7
+pub const attribute_kind_no_arg = 8
+pub const attribute_kind_raw_string = 16
+
+const static_type_method_name_marker = '@static@'
+
+// empty_node_ids returns `len` ids that are all empty_node. A single memset
+// fills them: empty_node is -1, every byte of which is 0xff. An `init:` value
+// would set each element on its own.
+pub fn empty_node_ids(len int) []NodeId {
+	mut ids := []NodeId{len: len}
+	if len > 0 {
+		unsafe { C.memset(ids.data, 0xff, uint(len) * sizeof(NodeId)) }
+	}
+	return ids
+}
+
+// encode_static_type_method_name makes a reversible internal name for a static type method.
+pub fn encode_static_type_method_name(receiver string, method string) string {
+	return '${receiver}${static_type_method_name_marker}${method}'
+}
+
+// decode_static_type_method_name recovers the receiver and method from an internal static name.
+pub fn decode_static_type_method_name(name string) ?(string, string) {
+	marker := name.index(static_type_method_name_marker) or { return none }
+	method_start := marker + static_type_method_name_marker.len
+	if marker == 0 || method_start >= name.len {
+		return none
+	}
+	return name[..marker], name[method_start..]
+}
+
+const empty_node_value = Node{}
+
+// NodeKind lists node kind values used by flat.
+pub enum NodeKind as u8 {
+	empty
+	// expressions
+	int_literal
+	float_literal
+	bool_literal
+	char_literal
+	string_literal
+	string_interp
+	ident
+	infix
+	prefix
+	postfix
+	paren
+	call
+	selector
+	index
+	if_expr
+	struct_init
+	field_init
+	array_literal
+	array_init
+	map_init
+	fn_literal
+	or_expr
+	cast_expr
+	as_expr
+	enum_val
+	assoc
+	range
+	nil_literal
+	none_expr
+	spawn_expr
+	lock_expr
+	lambda_expr
+	sizeof_expr
+	typeof_expr
+	dump_expr
+	offsetof_expr
+	is_expr
+	in_expr
+	// statements
+	expr_stmt
+	assign
+	decl_assign
+	selector_assign
+	index_assign
+	return_stmt
+	block
+	for_stmt
+	for_in_stmt
+	break_stmt
+	continue_stmt
+	match_stmt
+	match_branch
+	defer_stmt
+	assert_stmt
+	goto_stmt
+	label_stmt
+	select_stmt
+	select_branch
+	comptime_if
+	comptime_for
+	asm_stmt
+	// declarations
+	fn_decl
+	struct_decl
+	field_decl
+	global_decl
+	const_decl
+	const_field
+	enum_decl
+	enum_field
+	type_decl
+	interface_decl
+	interface_field
+	import_decl
+	module_decl
+	directive
+	param
+	c_fn_decl
+	// top-level
+	file
+	sql_expr
+	// A `$veb.html(...)` / `$tmpl(...)` comptime-template placeholder. It is produced
+	// by parse_comptime_expr and fully expanded (into builder statements) by
+	// parse_block_body at parse time, so it never reaches later phases.
+	veb_template
+	// A `$res()` / `$res(index)` expression. This must remain distinct from
+	// `.ident` so user-spellable names cannot be reinterpreted as defer results.
+	defer_result
+	// A `$dbg;` statement. Keep new node kinds at the end because the hot phase
+	// dispatchers use stable numeric ids for the older kinds.
+	debugger_stmt
+}
+
+// Op lists op values used by flat.
+pub enum Op as u8 {
+	none
+	plus
+	minus
+	mul
+	div
+	mod
+	eq
+	ne
+	lt
+	gt
+	le
+	ge
+	amp
+	pipe
+	xor
+	left_shift
+	right_shift
+	right_shift_unsigned
+	logical_and
+	logical_or
+	not
+	bit_not
+	assign
+	plus_assign
+	minus_assign
+	mul_assign
+	div_assign
+	mod_assign
+	amp_assign
+	pipe_assign
+	xor_assign
+	left_shift_assign
+	right_shift_assign
+	right_shift_unsigned_assign
+	inc
+	dec
+	dot
+	arrow
+	gated_index
+	power
+	power_assign
+}
+
+// NodePayload holds the uncommon managed fields used only by declarations and
+// a handful of lowering markers. Keeping it out of Node makes the hot flat
+// header substantially smaller without changing string-facing phase APIs.
+@[heap]
+pub struct NodePayload {
+pub:
+	generic_params []string
+	// The constraint each type parameter names, `Named` in `[T Named]`, as it is
+	// written: empty for a parameter without one, and no list at all when none
+	// of them names one.
+	generic_constraints TypeTextList
+	// Enum backing storage is source type metadata, separate from generic/attribute names.
+	enum_backing_type u32
+	// Per-expression debugger source types are separate from binding/display metadata.
+	debugger_value_types TypeTextList
+	// Explicit generic call arguments are source spellings, independent of call markers.
+	call_type_args TypeTextList
+	// Function-value signatures are distinct from the selector result annotation.
+	fn_value_type u32
+	// Lowered sum-variant accesses retain the selected source variant identity.
+	generated_variant_type u32
+	// Optional mutable argument views retain their source identity independently of typ.
+	mut_optional_arg_view_type u32
+	// Struct and enum field attributes keep each attribute's VAttribute kind as the spelling
+	// of a comma-separated list aligned with the attribute names, like the `@attributes:`
+	// directive of a declaration. The names unquote `@['x']`, so they cannot tell its kind.
+	attribute_kinds u32
+}
+
+// Comment retains source comments for syntax-preserving tools such as vfmt.
+pub struct Comment {
+pub:
+	text string
+	pos  token.Pos
+}
+
+// Node payloads live in one process-wide table: a node carries a 4-byte id
+// (0 = none) instead of a pointer, so copying a node copies the id and the
+// node header stays compact. The table only grows (payloads are rare and
+// tiny), its chunks outlive every arena, and ids are handed out under a spin
+// lock while lookups are lock-free: an insert writes the chunk pointer and
+// the entry first and then publishes the new count with a release store, and
+// a lookup acquire-loads the count before it reads either. The lock, the
+// atomics and the raw allocations live in flat_payload.c.v.
+const node_payload_chunk_bits = 12
+const node_payload_chunk_size = 1 << node_payload_chunk_bits
+const node_payload_chunk_mask = node_payload_chunk_size - 1
+const node_payload_max_chunks = 4096
+
+// canonical_comptime_type_payload marks an already resolved reflection type without an allocation.
+// Its reserved id is outside the table range; node_payload_at returns a static empty payload.
+pub const canonical_comptime_type_payload = u32(0xffffffff)
+
+struct NodePayloadTable {
+mut:
+	chunks [node_payload_max_chunks]voidptr
+	count  u32 // published/read through node_payload_count_publish/_load
+}
+
+__global g_node_payload_table &NodePayloadTable
+__global g_node_payload_lock u32
+__global g_canonical_comptime_payload NodePayload
+// Empty borrowed type lists share a typed descriptor without rebuilding it per lookup.
+__global g_empty_source_type_ids []u32 = []u32{}
+// Accessors of nodes without a payload share this empty list instead of
+// constructing one per call; readers never write through a zero-capacity view.
+__global g_empty_payload_texts []string = []string{}
+
+// node_payload registers an uncommon node payload and returns its id, or 0
+// for an empty list.
+pub fn node_payload(generic_params []string) u32 {
+	return node_payload_with_constraints(generic_params, []string{})
+}
+
+// node_payload_with_constraints registers generic params with the constraints
+// they name (see NodePayload), and returns the payload id, or 0 when both are
+// empty.
+pub fn node_payload_with_constraints(generic_params []string, generic_constraints []string) u32 {
+	return node_payload_with_type_constraints(generic_params, TypeTextList.from_names(generic_constraints))
+}
+
+// node_payload_with_constraint_ids registers generic names and source constraint identities.
+// The ordered constraint list is copied before the immutable payload is published.
+pub fn node_payload_with_constraint_ids(params []string, constraints []u32) u32 {
+	return node_payload_with_type_constraints(params, TypeTextList{ ids: constraints.clone() })
+}
+
+// node_payload_with_type_metadata registers names and independent source type metadata.
+// Names follow node_payload ownership rules; the debugger ID list is copied from the caller.
+pub fn node_payload_with_type_metadata(generic_params []string, enum_backing_type u32, debugger_types []u32) u32 {
+	return node_payload_with_types(generic_params, TypeTextList{}, enum_backing_type, TypeTextList{ ids: debugger_types.clone() }, TypeTextList{}, 0, 0, 0, 0)
+}
+
+// node_payload_with_debugger_types registers binding/display names with ordered source type IDs.
+// The source ID list is copied, so later caller mutation cannot change the immutable payload.
+pub fn node_payload_with_debugger_types(generic_params []string, debugger_types []u32) u32 {
+	return node_payload_with_type_metadata(generic_params, 0, debugger_types)
+}
+
+// node_payload_with_fn_value_type registers marker names and an independent source type identity.
+// Names follow node_payload ownership rules; the source identity remains process-wide.
+pub fn node_payload_with_fn_value_type(params []string, type_id u32) u32 {
+	return node_payload_with_types(params, TypeTextList{}, 0, TypeTextList{}, TypeTextList{}, type_id, 0, 0, 0)
+}
+
+// node_payload_with_generated_variant_type registers marker names and an independent source type identity.
+// Names follow node_payload ownership rules; the source identity remains process-wide.
+pub fn node_payload_with_generated_variant_type(params []string, type_id u32) u32 {
+	return node_payload_with_types(params, TypeTextList{}, 0, TypeTextList{}, TypeTextList{}, 0, type_id, 0, 0)
+}
+
+// node_payload_with_mut_optional_arg_view_type registers marker names and an independent source type identity.
+// Names follow node_payload ownership rules; the source identity remains process-wide.
+pub fn node_payload_with_mut_optional_arg_view_type(params []string, type_id u32) u32 {
+	return node_payload_with_types(params, TypeTextList{}, 0, TypeTextList{}, TypeTextList{}, 0, 0, type_id, 0)
+}
+
+// node_payload_with_attribute_kinds registers field attribute names with the spelling id of
+// their comma-separated VAttribute kinds (see NodePayload.attribute_kinds).
+pub fn node_payload_with_attribute_kinds(params []string, attribute_kinds u32) u32 {
+	return node_payload_with_types(params, TypeTextList{}, 0, TypeTextList{}, TypeTextList{}, 0, 0, 0, attribute_kinds)
+}
+
+fn node_payload_with_type_constraints(generic_params []string, generic_constraints TypeTextList) u32 {
+	return node_payload_with_types(generic_params, generic_constraints, 0, TypeTextList{}, TypeTextList{}, 0, 0, 0, 0)
+}
+
+fn node_payload_with_types(generic_params []string, generic_constraints TypeTextList, enum_backing_type u32, debugger_value_types TypeTextList, call_type_args TypeTextList, fn_value_type u32, generated_variant_type u32, mut_optional_arg_view_type u32, attribute_kinds u32) u32 {
+	if generic_params.len == 0 && generic_constraints.ids.len == 0 && enum_backing_type == 0 && debugger_value_types.ids.len == 0 && call_type_args.ids.len == 0 && fn_value_type == 0 && generated_variant_type == 0 && mut_optional_arg_view_type == 0 && attribute_kinds == 0 {
+		return 0
+	}
+	payload := &NodePayload{
+		generic_params:             generic_params
+		generic_constraints:        generic_constraints
+		enum_backing_type:          enum_backing_type
+		debugger_value_types:       debugger_value_types
+		call_type_args:             call_type_args
+		fn_value_type:              fn_value_type
+		generated_variant_type:     generated_variant_type
+		mut_optional_arg_view_type: mut_optional_arg_view_type
+		attribute_kinds:            attribute_kinds
+	}
+	node_payload_lock()
+	mut table := node_payload_table_load()
+	if isnil(table) {
+		table = node_payload_new_table()
+		if isnil(table) {
+			node_payload_unlock()
+			panic('v3: could not allocate the node payload table')
+		}
+		node_payload_table_publish(table)
+	}
+	idx := int(table.count)
+	chunk_idx := idx >> node_payload_chunk_bits
+	if chunk_idx >= node_payload_max_chunks {
+		node_payload_unlock()
+		panic('v3: too many node payloads (${idx})')
+	}
+	mut chunk := payload_ptr_get(voidptr(table), uint(chunk_idx))
+	if isnil(chunk) {
+		chunk = node_payload_new_chunk()
+		payload_ptr_set(voidptr(table), uint(chunk_idx), chunk)
+		if isnil(chunk) {
+			node_payload_unlock()
+			panic('v3: could not allocate a node payload chunk')
+		}
+	}
+	payload_ptr_set(chunk, uint(idx & node_payload_chunk_mask), voidptr(payload))
+	node_payload_count_publish(table, u32(idx + 1))
+	node_payload_unlock()
+	return u32(idx + 1)
+}
+
+// node_payload_at resolves a payload id registered by node_payload; 0 yields nil.
+// canonical_comptime_type_payload yields a static empty payload that outlives all arenas.
+pub fn node_payload_at(id u32) &NodePayload {
+	if id == canonical_comptime_type_payload {
+		return &g_canonical_comptime_payload
+	}
+	if id == 0 {
+		return &NodePayload(unsafe { nil })
+	}
+	idx := int(id) - 1
+	table := node_payload_table_load()
+	if isnil(table) || idx >= int(node_payload_count_load(table)) {
+		return &NodePayload(unsafe { nil })
+	}
+	chunk := payload_ptr_get(voidptr(table), uint(idx >> node_payload_chunk_bits))
+	return unsafe { &NodePayload(payload_ptr_get(chunk, uint(idx & node_payload_chunk_mask))) }
+}
+
+// node_flag_skip_ownership_drops marks a block/if/for/fn node whose scope must
+// not consume ownership drops (see Node.skip_ownership_drops()).
+pub const node_flag_skip_ownership_drops = u8(1)
+// node_flag_static_type_method marks a `fn Type.method()` declaration.
+pub const node_flag_static_type_method = u8(2)
+// node_flag_embed_payload marks the string literal holding the bytes that
+// `$embed_file` materialized (see Node.is_embed_payload()).
+pub const node_flag_embed_payload = u8(4)
+// node_flag_freed_assignment marks an assignment annotated with `@[freed]`.
+pub const node_flag_freed_assignment = u8(8)
+// node_flag_borrowed_map_key marks a generated read-only map iteration whose
+// key cannot escape. The bit is shared with the assignment-only flag above.
+pub const node_flag_borrowed_map_key = u8(8)
+// node_flag_in_range_index marks an `.index` read the transform proved in range
+// (see Node.is_in_range_index()). The bit is shared with the flags above.
+pub const node_flag_in_range_index = u8(8)
+// node_flag_mut_builtin_pointer_param marks a source `mut p voidptr`/`byteptr`/`charptr`
+// parameter before the parser folds its mutable caller slot into the type text.
+pub const node_flag_mut_builtin_pointer_param = u8(16)
+// node_flag_literal_interpolation_text marks a string literal whose source token
+// contained `${...}` as literal text (for example, `\${name}` or a raw string).
+pub const node_flag_literal_interpolation_text = u8(32)
+// node_flag_detached_spawn marks a `spawn` whose thread handle is discarded, so the
+// backend starts its thread detached (see Node.is_detached_spawn()).
+pub const node_flag_detached_spawn = u8(64)
+// node_flag_variadic_call preserves the checker's V variadic call selection,
+// including function values whose packed array type does not carry that metadata.
+pub const node_flag_variadic_call = u8(128)
+
+// node_flags packs rare node bools into Node.flags.
+@[inline]
+pub fn node_flags(skip_ownership_drops bool, is_static_type_method bool) u8 {
+	mut flags := u8(0)
+	if skip_ownership_drops {
+		flags |= node_flag_skip_ownership_drops
+	}
+	if is_static_type_method {
+		flags |= node_flag_static_type_method
+	}
+	return flags
+}
+
+// clone_node_flags rebuilds the flags of a node copied from `source`.
+//
+// `skip_ownership_drops` describes the scope a node sits in, so a copy is given
+// whatever its new position calls for. The rest describe the node itself and
+// have to survive being copied: a generic specialization that dropped
+// node_flag_embed_payload would turn the payload back into an ordinary literal,
+// which the backend would then intern and spell out in full. Assignment
+// attributes likewise remain attached when a statement is specialized.
+@[inline]
+pub fn clone_node_flags(source &Node, skip_ownership_drops bool) u8 {
+	mut flags := node_flags(skip_ownership_drops, source.is_static_type_method())
+	flags |= source.flags & (node_flag_embed_payload | node_flag_freed_assignment |
+		node_flag_mut_builtin_pointer_param | node_flag_literal_interpolation_text |
+		node_flag_detached_spawn | node_flag_variadic_call)
+	return flags
+}
+
+// Node represents node data used by flat.
+pub struct Node {
+pub mut:
+	value          string
+	typ            u32
+	children_start i32
+	payload        u32 // payload id or canonical_comptime_type_payload; 0 = none
+	is_mut         bool
+	kind           NodeKind
+	op             Op
+	flags          u8 // node_flag_* bits; see skip_ownership_drops/is_static_type_method
+	children_count i32
+	pos            token.Pos
+	source_value   u32 // original type operand spelling; separate from the checked annotation
+}
+
+// value_text resolves original type operands, explicit call type arguments or ordinary text.
+// Value receivers keep these borrowed accessors from heap-promoting caller-local nodes.
+@[inline]
+pub fn (n Node) value_text() string {
+	// Raw text wins while a freshly constructed or rewritten node is canonicalized.
+	if n.value.len > 0 {
+		return n.value
+	}
+	if n.source_value != 0 {
+		return source_type_name(n.source_value)
+	}
+	if n.kind == .call && n.payload != 0 {
+		return node_payload_at(n.payload).call_type_args.names().join(', ')
+	}
+	return ''
+}
+
+// source_value_id returns the original operand spelling independently of its annotation.
+@[inline]
+pub fn (n Node) source_value_id() u32 {
+	if n.value.len > 0 {
+		return source_type_id(n.value)
+	}
+	return n.source_value
+}
+
+// source_value_kinds has bit `k` set for every node kind `k` whose value is a
+// type operand. All of these kinds are below 64.
+pub const source_value_kinds = u64(1) << u8(NodeKind.struct_init) | u64(1) << u8(NodeKind.assoc) |
+	u64(1) << u8(NodeKind.cast_expr) | u64(1) << u8(NodeKind.as_expr) |
+	u64(1) << u8(NodeKind.is_expr) | u64(1) << u8(NodeKind.map_init) |
+	u64(1) << u8(NodeKind.array_init) | u64(1) << u8(NodeKind.array_literal) |
+	u64(1) << u8(NodeKind.sizeof_expr) | u64(1) << u8(NodeKind.typeof_expr) |
+	u64(1) << u8(NodeKind.offsetof_expr)
+
+@[inline]
+fn (n Node) has_source_value_kind() bool {
+	return u8(n.kind) < 64 && (source_value_kinds >> u8(n.kind)) & 1 != 0
+}
+
+// set_value_text preserves indexed type operands and ordinary node text separately.
+@[inline]
+pub fn (mut n Node) set_value_text(text string) {
+	if n.source_value != 0 || n.has_source_value_kind() {
+		n.set_source_value_id(source_type_id(text))
+	} else {
+		n.value = text
+	}
+}
+
+// set_source_value_id stores an original type operand, including type-only identifiers.
+@[inline]
+pub fn (mut n Node) set_source_value_id(id u32) {
+	n.source_value = id
+	n.value = ''
+}
+
+// canonicalize_source_value indexes legacy type operands before publishing a node.
+@[inline]
+pub fn (mut n Node) canonicalize_source_value() {
+	if n.value.len > 0 && (n.source_value != 0 || n.has_source_value_kind()) {
+		n.set_source_value_id(source_type_id(n.value))
+	}
+}
+
+// typ_text resolves a node's indexed annotation at a source or emission boundary.
+@[inline]
+pub fn (n &Node) typ_text() string {
+	return source_type_name(n.typ)
+}
+
+// set_type_text replaces a node annotation with an owned, stable spelling ID.
+pub fn (mut n Node) set_type_text(text string) {
+	n.typ = source_type_id(text)
+}
+
+// is_detached_spawn reports whether this `spawn` has its thread handle discarded:
+// nothing can join its thread, so the backend starts it detached.
+@[inline]
+pub fn (n &Node) is_detached_spawn() bool {
+	return (n.flags & node_flag_detached_spawn) != 0
+}
+
+// skip_ownership_drops reports whether this scope node must not consume
+// ownership drops.
+@[inline]
+pub fn (n &Node) skip_ownership_drops() bool {
+	return (n.flags & node_flag_skip_ownership_drops) != 0
+}
+
+// borrows_map_key reports whether a generated map loop only borrows its key.
+@[inline]
+pub fn (n &Node) borrows_map_key() bool {
+	return n.kind == .for_in_stmt && (n.flags & node_flag_borrowed_map_key) != 0
+}
+
+// set_skip_ownership_drops updates the skip-ownership-drops flag.
+@[inline]
+pub fn (mut n Node) set_skip_ownership_drops(value bool) {
+	if value {
+		n.flags |= node_flag_skip_ownership_drops
+	} else {
+		n.flags &= ~node_flag_skip_ownership_drops
+	}
+}
+
+// is_static_type_method reports whether this fn_decl is a `fn Type.method()`.
+@[inline]
+pub fn (n &Node) is_static_type_method() bool {
+	return (n.flags & node_flag_static_type_method) != 0
+}
+
+// is_embed_payload reports whether this string literal holds the bytes that
+// `$embed_file` materialized. Such a literal is written out by the embed
+// codegen alone, so it must be kept out of the interned literal table: an
+// entry there is never referenced, and it repeats the whole payload on a
+// single source line.
+@[inline]
+pub fn (n &Node) is_embed_payload() bool {
+	return (n.flags & node_flag_embed_payload) != 0
+}
+
+// is_freed_assignment reports whether an assignment has the `@[freed]` attribute.
+@[inline]
+pub fn (n &Node) is_freed_assignment() bool {
+	return (n.flags & node_flag_freed_assignment) != 0
+}
+
+// has_literal_interpolation_text reports whether `${...}` in this string literal
+// was parsed as text and must not be reinterpreted by nested-interpolation lowering.
+@[inline]
+pub fn (n &Node) has_literal_interpolation_text() bool {
+	return (n.flags & node_flag_literal_interpolation_text) != 0
+}
+
+// is_in_range_index reports whether this array or string index read needs no
+// bounds check: its loop proves the index is in range for the indexed value.
+@[inline]
+pub fn (n &Node) is_in_range_index() bool {
+	return n.kind == .index && (n.flags & node_flag_in_range_index) != 0
+}
+
+// is_mut_builtin_pointer_param reports whether this parameter was declared as
+// `mut p voidptr`, `mut p byteptr`, or `mut p charptr` in source.
+@[inline]
+pub fn (n &Node) is_mut_builtin_pointer_param() bool {
+	return (n.flags & node_flag_mut_builtin_pointer_param) != 0
+}
+
+// set_freed_assignment updates the assignment's `@[freed]` marker.
+@[inline]
+pub fn (mut n Node) set_freed_assignment(value bool) {
+	if value {
+		n.flags |= node_flag_freed_assignment
+	} else {
+		n.flags &= ~node_flag_freed_assignment
+	}
+}
+
+// set_is_static_type_method updates the static-type-method flag.
+@[inline]
+pub fn (mut n Node) set_is_static_type_method(value bool) {
+	if value {
+		n.flags |= node_flag_static_type_method
+	} else {
+		n.flags &= ~node_flag_static_type_method
+	}
+}
+
+// payload_ptr resolves this node's uncommon payload, or nil when it has none.
+@[inline]
+pub fn (n &Node) payload_ptr() &NodePayload {
+	return node_payload_at(n.payload)
+}
+
+fn (n Node) payload_metadata() &NodePayload {
+	if n.payload == 0 {
+		return &g_canonical_comptime_payload
+	}
+	return node_payload_at(n.payload)
+}
+
+// type_text_id returns the stable u32 source-spelling identity of this annotation.
+@[inline]
+pub fn (n &Node) type_text_id() u32 {
+	return n.typ
+}
+
+// generic_params returns this node's uncommon generic/attribute metadata.
+@[inline]
+pub fn (n &Node) generic_params() []string {
+	if n.payload == 0 {
+		return g_empty_payload_texts
+	}
+	return node_payload_at(n.payload).generic_params
+}
+
+// generic_constraints returns the constraint each generic param names (see
+// NodePayload).
+@[inline]
+pub fn (n &Node) generic_constraints() []string {
+	if n.payload == 0 {
+		return g_empty_payload_texts
+	}
+	return node_payload_at(n.payload).generic_constraints.names()
+}
+
+// generic_constraint_ids returns the ordered source-spelling IDs of this node's
+// generic constraints. The immutable payload values are borrowed for read-only use.
+@[inline]
+pub fn (n &Node) generic_constraint_ids() []u32 {
+	if n.payload == 0 {
+		return g_empty_source_type_ids
+	}
+	return node_payload_at(n.payload).generic_constraints.ids
+}
+
+// enum_backing_type_id returns the enum's explicit source storage type, or zero when absent.
+// The source identity is immutable and remains valid across workers and disposable arenas.
+@[inline]
+pub fn (n &Node) enum_backing_type_id() u32 {
+	if n.payload == 0 || n.kind != .enum_decl { return 0 }
+	return node_payload_at(n.payload).enum_backing_type
+}
+
+// attribute_kinds_id returns the spelling id of a field's comma-separated attribute kinds,
+// or zero when the parser did not record them.
+@[inline]
+pub fn (n &Node) attribute_kinds_id() u32 {
+	if n.payload == 0 {
+		return 0
+	}
+	return node_payload_at(n.payload).attribute_kinds
+}
+
+// set_enum_backing_type_id replaces the source storage type while preserving other metadata.
+// Generic parameter and attribute names remain separate from this source spelling identity.
+@[inline]
+pub fn (mut n Node) set_enum_backing_type_id(type_id u32) {
+	payload := n.payload_metadata()
+	n.payload = node_payload_with_types(payload.generic_params.clone(), payload.generic_constraints.clone(), type_id, payload.debugger_value_types.clone(), payload.call_type_args.clone(), payload.fn_value_type, payload.generated_variant_type, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+}
+
+// debugger_value_type_ids returns the source type IDs ordered with debugger child expressions.
+// The immutable payload list is borrowed for read-only use.
+@[inline]
+pub fn (n &Node) debugger_value_type_ids() []u32 {
+	if n.payload == 0 || n.kind != .debugger_stmt { return g_empty_source_type_ids }
+	return node_payload_at(n.payload).debugger_value_types.ids
+}
+
+// set_debugger_value_type_ids replaces the ordered source types and preserves other metadata.
+// The input list is copied before publication, so caller mutation cannot change the payload.
+@[inline]
+pub fn (mut n Node) set_debugger_value_type_ids(type_ids []u32) {
+	payload := n.payload_metadata()
+	n.payload = node_payload_with_types(payload.generic_params.clone(), payload.generic_constraints.clone(), payload.enum_backing_type, TypeTextList{ ids: type_ids.clone() }, payload.call_type_args.clone(), payload.fn_value_type, payload.generated_variant_type, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+}
+
+// call_type_args returns the ordered source-spelling IDs of explicit generic call arguments.
+// The immutable payload list is borrowed for read-only use; call markers remain in value.
+@[inline]
+pub fn (n Node) call_type_args() []u32 {
+	if n.payload == 0 {
+		return g_empty_source_type_ids
+	}
+	return node_payload_at(n.payload).call_type_args.ids
+}
+
+// set_call_type_args replaces explicit generic arguments while preserving other metadata.
+// The input list is copied before publication, independently of caller-owned storage.
+@[inline]
+pub fn (mut n Node) set_call_type_args(args []u32) {
+	payload := n.payload_metadata()
+	n.payload = node_payload_with_types(payload.generic_params.clone(), payload.generic_constraints.clone(), payload.enum_backing_type, payload.debugger_value_types.clone(), TypeTextList{ ids: args.clone() }, payload.fn_value_type, payload.generated_variant_type, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+}
+
+// fn_value_type_id returns the lowered source type identity, or zero when absent.
+// This metadata is independent of the node's result annotation and ordinary marker names.
+@[inline]
+pub fn (n Node) fn_value_type_id() u32 {
+	if n.payload == 0 {
+		return 0
+	}
+	return node_payload_at(n.payload).fn_value_type
+}
+
+// set_fn_value_type_id replaces the lowered source identity and preserves all other metadata.
+@[inline]
+pub fn (mut n Node) set_fn_value_type_id(type_id u32) {
+	payload := n.payload_metadata()
+	n.payload = node_payload_with_types(payload.generic_params.clone(), payload.generic_constraints.clone(), payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), type_id, payload.generated_variant_type, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+}
+
+// set_generic_params_and_fn_value_type_id replaces marker names and the lowered source identity.
+// Equal-length generic constraints and all other source metadata remain independent.
+@[inline]
+pub fn (mut n Node) set_generic_params_and_fn_value_type_id(params []string, type_id u32) {
+	payload := n.payload_metadata()
+	constraints := payload.generic_constraints
+	n.payload = node_payload_with_types(params, if constraints.ids.len == params.len {
+		constraints.clone()
+	} else {
+		TypeTextList{}
+	}, payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), type_id, payload.generated_variant_type, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+}
+
+// generated_variant_type_id returns the lowered source type identity, or zero when absent.
+// This metadata is independent of the node's result annotation and ordinary marker names.
+@[inline]
+pub fn (n Node) generated_variant_type_id() u32 {
+	if n.payload == 0 {
+		return 0
+	}
+	return node_payload_at(n.payload).generated_variant_type
+}
+
+// set_generated_variant_type_id replaces the lowered source identity and preserves all other metadata.
+@[inline]
+pub fn (mut n Node) set_generated_variant_type_id(type_id u32) {
+	payload := n.payload_metadata()
+	n.payload = node_payload_with_types(payload.generic_params.clone(), payload.generic_constraints.clone(), payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), payload.fn_value_type, type_id, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+}
+
+// set_generic_params_and_generated_variant_type_id replaces marker names and the lowered source identity.
+// Equal-length generic constraints and all other source metadata remain independent.
+@[inline]
+pub fn (mut n Node) set_generic_params_and_generated_variant_type_id(params []string, type_id u32) {
+	payload := n.payload_metadata()
+	constraints := payload.generic_constraints
+	n.payload = node_payload_with_types(params, if constraints.ids.len == params.len {
+		constraints.clone()
+	} else {
+		TypeTextList{}
+	}, payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), payload.fn_value_type, type_id, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+}
+
+// mut_optional_arg_view_type_id returns the lowered source type identity, or zero when absent.
+// This metadata is independent of the node's result annotation and ordinary marker names.
+@[inline]
+pub fn (n Node) mut_optional_arg_view_type_id() u32 {
+	if n.payload == 0 {
+		return 0
+	}
+	return node_payload_at(n.payload).mut_optional_arg_view_type
+}
+
+// set_mut_optional_arg_view_type_id replaces the lowered source identity and preserves all other metadata.
+@[inline]
+pub fn (mut n Node) set_mut_optional_arg_view_type_id(type_id u32) {
+	payload := n.payload_metadata()
+	n.payload = node_payload_with_types(payload.generic_params.clone(), payload.generic_constraints.clone(), payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), payload.fn_value_type, payload.generated_variant_type, type_id, payload.attribute_kinds)
+}
+
+// set_generic_params_and_mut_optional_arg_view_type_id replaces marker names and the lowered source identity.
+// Equal-length generic constraints and all other source metadata remain independent.
+@[inline]
+pub fn (mut n Node) set_generic_params_and_mut_optional_arg_view_type_id(params []string, type_id u32) {
+	payload := n.payload_metadata()
+	constraints := payload.generic_constraints
+	n.payload = node_payload_with_types(params, if constraints.ids.len == params.len {
+		constraints.clone()
+	} else {
+		TypeTextList{}
+	}, payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), payload.fn_value_type, payload.generated_variant_type, type_id, payload.attribute_kinds)
+}
+
+// has_lowered_type_metadata reports whether a payload retains an independent lowered type.
+@[inline]
+pub fn (n Node) has_lowered_type_metadata() bool {
+	if n.payload == 0 {
+		return false
+	}
+	payload := node_payload_at(n.payload)
+	return payload.fn_value_type != 0 || payload.generated_variant_type != 0
+		|| payload.mut_optional_arg_view_type != 0
+}
+
+// set_generic_params replaces this node's uncommon managed payload. The
+// constraints of the params it replaces stay when there are as many params: the
+// passes that move the params to longer-lived memory rebuild the payload.
+@[inline]
+pub fn (mut n Node) set_generic_params(params []string) {
+	payload := n.payload_metadata()
+	constraints := payload.generic_constraints
+	n.payload = node_payload_with_types(params, if constraints.ids.len == params.len {
+		constraints.clone()
+	} else {
+		TypeTextList{}
+	}, payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), payload.fn_value_type, payload.generated_variant_type, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+}
+
+// set_generic_params_and_constraints replaces this node's generic params and the
+// constraints they name.
+@[inline]
+pub fn (mut n Node) set_generic_params_and_constraints(params []string, constraints []string) {
+	payload := n.payload_metadata()
+	n.payload = node_payload_with_types(params, TypeTextList.from_names(constraints), payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), payload.fn_value_type, payload.generated_variant_type, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+}
+
+// set_generic_params_and_constraint_ids replaces generic names and source constraint identities.
+// The constraint list is copied and independent source type metadata is preserved.
+@[inline]
+pub fn (mut n Node) set_generic_params_and_constraint_ids(params []string, constraints []u32) {
+	payload := n.payload_metadata()
+	n.payload = node_payload_with_types(params, TypeTextList{ ids: constraints.clone() }, payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), payload.fn_value_type, payload.generated_variant_type, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+}
+
+// FlatAst represents flat ast data used by flat.
+@[heap]
+pub struct FlatAst {
+pub mut:
+	// guard_exhaustive_match makes the transformer stop on a value that no branch
+	// of an exhaustive value `match` names. Set for the native backend.
+	guard_exhaustive_match bool
+
+	nodes           []Node
+	children        []NodeId
+	user_code_start int
+	// parsed_node_count is the number of nodes the parser produced, or 0 when
+	// it was not recorded. Later stages append synthesized nodes past it, in an
+	// order that can depend on how their work was split across threads.
+	parsed_node_count int
+	disabled_fns      map[string]bool
+	// The names spelled inside a `$if`/`$match` body this build does not take,
+	// keyed by `<file>:<fn name offset>|<name>`. The body is never parsed, so
+	// nothing in the AST records its identifier occurrences or reads.
+	comptime_skipped_names      map[string]bool
+	comptime_skipped_read_names map[string]bool
+	// Every name spelled in such a skipped body, whatever it refers to, keyed by
+	// comptime_skipped_decl_key. A function or constant used only on another
+	// target is not unused.
+	comptime_skipped_decl_names map[string]bool
+	// Goto label operands use the same key format, but are not local-name uses.
+	comptime_skipped_goto_labels map[string]bool
+	export_fn_names              map[string]string
+	noreturn_fns                 map[string]bool
+	source_files                 map[int]&token.File
+	// resolved_source_paths maps source paths to their resolved form. The owning
+	// thread fills it through record_source_path and resolve_source_paths, which
+	// sets source_paths_frozen; from then on it is only read, see real_source_path.
+	resolved_source_paths map[string]string
+	source_paths_frozen   bool
+	comments              []Comment
+	// formatter_sources retains exact source spans or prefixes for constructs whose
+	// source syntax is intentionally opaque to compiler backends.
+	formatter_sources      map[int]string
+	formatter_file_sources map[int]string
+	// formatter_node_ends retains the full source end for nodes whose compiler-facing
+	// position deliberately covers only their name or another diagnostic token.
+	formatter_node_ends map[int]int
+	// formatter_expanded_calls records calls whose arguments started on the next line
+	// and ended with a trailing comma.
+	formatter_expanded_calls map[int]bool
+	// formatter_assignment_ops retains compound operator spellings that share one flat op.
+	formatter_assignment_ops map[int]string
+	// formatter_param_list_end retains the closing-parenthesis offset for parameter lists.
+	formatter_param_list_end map[int]int
+	// formatter_for_in_mut retains which for-in binder carried `mut`:
+	// bit 0 is the first binder and bit 1 is the second binder.
+	formatter_for_in_mut map[int]u8
+	// formatter_local_sels records selectors whose direct receiver is a lexical binding.
+	formatter_local_sels    map[int]bool
+	formatter_migrate_json2 bool
+	// monomorph_tail_nodes and monomorph_tail_children are the capacity at the end
+	// of nodes and children that the transform stage reserves for the specializer
+	// of the monomorphization stage; the transform stage's own append regions
+	// leave it alone.
+	monomorph_tail_nodes    int
+	monomorph_tail_children int
+	// Template-generated nodes keep their original template source location while
+	// retaining the comptime call site used for v1-compatible diagnostic stacks.
+	template_call_sites map[int]token.Pos
+	template_actions    map[int]string
+	// missing_imports retains source import paths for unresolved import nodes.
+	missing_imports map[int]string
+	// missing_import_hints holds the migration hint the resolver produced for an
+	// unresolved import node, when it can explain the failure. Usually empty.
+	missing_import_hints map[int]string
+	// resolved_module_dirs maps canonical module identities to their resolved directories.
+	resolved_module_dirs map[string]string
+	// cached_header_sources maps each module cache header parsed in place of a
+	// module's sources to one of those sources, so diagnostics and ownership can
+	// judge a warm header by the code it stands for rather than by where the
+	// cache directory happens to be.
+	cached_header_sources map[string]string
+	// cached_header_module_sources maps each of those headers to all the sources
+	// of its module: a header holds what each of them declares.
+	cached_header_module_sources map[string][]string
+	// file_node_ids records every .file node the parser creates, in creation
+	// order: (marker, trailing) pairs per source file. The trailing node's
+	// children are the file's top-level declarations, letting collect build
+	// its top-level index without a full node scan. Stages that renumber
+	// nodes clear the list; consumers fall back to scanning when it is empty
+	// or file_index_incomplete is set (a source file failed to read).
+	file_node_ids         []i32
+	file_index_incomplete bool
+	// debugger_stmts counts the `$dbg` statements the parser created, so that
+	// a scan for them can stop once it knows there is none.
+	debugger_stmts int
+	// has_vsh_source records that at least one parsed source file is a `.vsh`
+	// script. V script mode makes the `os` module global inside such files, and
+	// the checker only pays for that lookup when this flag is set.
+	has_vsh_source bool
+	// raw_vsh_file is the parsed path of the script compiled without the `.vsh`
+	// extension (`-raw-vsh-tmp-prefix`), if any.
+	raw_vsh_file string
+	// source_buffers owns the storage behind zero-copy scanner strings retained
+	// by AST nodes. Keeping the buffers on the AST makes the lifetime boundary
+	// explicit and lets parser workers transfer ownership with their nodes.
+	source_buffers []string
+	// source_texts holds, by file id, the text of the sources that the parser read
+	// and was asked to keep (parser.Parser.keep_source_texts). A stage that needs
+	// the text of a parsed file takes it from here instead of reading the file
+	// again; a file that is not in the table is read from disk as before.
+	source_texts map[int]string
+	// text_values/text_ids own one canonical copy of every non-empty string
+	// stored in a node payload. Nodes keep string compatibility views while
+	// semantic/compiler caches can use compact TextId identities.
+	text_values []string
+	text_ids    map[string]TextId
+	// recent_text_ids borrows identities only; canonical storage stays in text_values.
+	recent_text_ids []TextId
+	worker_pool     &workers.Pool = unsafe { nil }
+	// contextual_anon_struct_types names the anonymous aggregates the parser
+	// synthesized to type a `struct { ... }` literal rather than to declare a field.
+	// Such a name only ever stands in for a literal whose type the context supplies, so
+	// the checker lets it initialize another module's anonymous field. The declarations
+	// themselves keep the visibility they were written with, so neither their generated
+	// names nor a type a user happened to call `AnonStruct_...` become reachable across
+	// module boundaries.
+	contextual_anon_struct_types map[u32]bool
+	// synthesized_anon_struct_types names every anonymous aggregate the parser made up,
+	// for a declaration as well as for a literal. A name matching `AnonStruct_` proves
+	// nothing on its own - a user may declare a type so named - so this is what tells
+	// the checker that an expected type really is one it may adopt a bare
+	// `struct { ... }` literal into.
+	synthesized_anon_struct_types map[u32]bool
+	// specialized_fn_nodes identifies program-specific monomorphized function
+	// declarations appended after parsing. Module-cache cgen keeps them with main.
+	specialized_fn_nodes   map[int]bool
+	specialized_fn_modules map[int]string
+	specialized_fn_files   map[int]string
+}
+
+// close_workers stops the compilation-owned persistent worker pool.
+pub fn (mut a FlatAst) close_workers() {
+	if !isnil(a.worker_pool) {
+		mut pool := a.worker_pool
+		a.worker_pool = unsafe { nil }
+		pool.close()
+	}
+}
+
+// ensure_workers creates the compilation-owned persistent worker pool when needed.
+pub fn (mut a FlatAst) ensure_workers(count int) {
+	if isnil(a.worker_pool) {
+		a.worker_pool = workers.new(count)
+	}
+}
+
+// worker_count reports the number of persistent compiler helper threads.
+pub fn (a &FlatAst) worker_count() int {
+	if isnil(a.worker_pool) {
+		return 0
+	}
+	return a.worker_pool.size()
+}
+
+// worker_tasks_run reports completed callbacks across all parallel phases.
+pub fn (a &FlatAst) worker_tasks_run() u64 {
+	if isnil(a.worker_pool) {
+		return 0
+	}
+	return a.worker_pool.tasks_run()
+}
+
+// worker_stats reports scheduling and utilization across compiler phases.
+pub fn (a &FlatAst) worker_stats() workers.Stats {
+	if isnil(a.worker_pool) {
+		return workers.Stats{}
+	}
+	return a.worker_pool.stats()
+}
+
+// set_node_is_mut updates a node's mut declaration marker in place.
+pub fn (mut a FlatAst) set_node_is_mut(id NodeId, is_mut bool) {
+	if int(id) < 0 || int(id) >= a.nodes.len {
+		return
+	}
+	// Mutate the array slot in place; copying flat.Node would duplicate managed fields.
+	unsafe {
+		mut node := &a.nodes[int(id)]
+		node.is_mut = is_mut
+	}
+}
+
+// comptime_skipped_decl_key returns the comptime_skipped_decl_names key for
+// `name` spelled in `file`. A private function or constant is only usable from
+// its own module, so the checker only probes that module's files. Files, not
+// module names, key the record: the loader may later rename a module to its
+// import path, but it never renames a file.
+pub fn comptime_skipped_decl_key(file string, name string) string {
+	return '${file}|${name}'
+}
+
+// new creates a FlatAst value for flat.
+pub fn FlatAst.new() FlatAst {
+	return FlatAst{
+		nodes:                         []Node{cap: 256}
+		children:                      []NodeId{cap: 512}
+		disabled_fns:                  map[string]bool{}
+		comptime_skipped_names:        map[string]bool{}
+		comptime_skipped_read_names:   map[string]bool{}
+		comptime_skipped_decl_names:   map[string]bool{}
+		comptime_skipped_goto_labels:  map[string]bool{}
+		export_fn_names:               map[string]string{}
+		noreturn_fns:                  map[string]bool{}
+		contextual_anon_struct_types:  map[u32]bool{}
+		synthesized_anon_struct_types: map[u32]bool{}
+		source_files:                  map[int]&token.File{}
+		template_call_sites:           map[int]token.Pos{}
+		template_actions:              map[int]string{}
+		missing_imports:               map[int]string{}
+		resolved_module_dirs:          map[string]string{}
+		cached_header_sources:         map[string]string{}
+		missing_import_hints:          map[int]string{}
+		formatter_sources:             map[int]string{}
+		formatter_file_sources:        map[int]string{}
+		formatter_node_ends:           map[int]int{}
+		formatter_expanded_calls:      map[int]bool{}
+		formatter_assignment_ops:      map[int]string{}
+		formatter_param_list_end:      map[int]int{}
+		formatter_for_in_mut:          map[int]u8{}
+		formatter_local_sels:          map[int]bool{}
+		text_ids:                      map[string]TextId{}
+		specialized_fn_nodes:          map[int]bool{}
+		specialized_fn_modules:        map[int]string{}
+		specialized_fn_files:          map[int]string{}
+	}
+}
+
+// intern_text returns the canonical AST-owned copy and stable identity of text.
+@[direct_array_access]
+pub fn (mut a FlatAst) intern_text(value string) (TextId, string) {
+	if value.len == 0 {
+		return TextId(0), ''
+	}
+	if a.recent_text_ids.len == 0 {
+		a.recent_text_ids = []TextId{len: 4096}
+	}
+	slot := source_type_recent_slot(value) & 4095
+	cached := a.recent_text_ids[slot]
+	if cached != 0 && int(cached) <= a.text_values.len {
+		canonical := a.text_values[int(cached) - 1]
+		if canonical == value {
+			return cached, canonical
+		}
+	}
+	if id := a.text_ids[value] {
+		a.recent_text_ids[slot] = id
+		return id, a.text_values[int(id) - 1]
+	}
+	id := TextId(a.text_values.len + 1)
+	// Appending the owned expression avoids another implicit string clone.
+	a.text_values << value.clone()
+	canonical := a.text_values.last()
+	a.text_ids[canonical] = id
+	a.recent_text_ids[slot] = id
+	return id, canonical
+}
+
+// intern_texts_from replays the source AST's compact text table into a.
+// The source table is already ordered by first occurrence, so this preserves
+// deterministic text identities while avoiding a second walk over every node.
+pub fn (mut a FlatAst) intern_texts_from(source &FlatAst) {
+	for value in source.text_values {
+		a.intern_text(value)
+	}
+}
+
+// reserve_transform_texts keeps canonical text-table backing in the
+// compilation arena before a disposable transform scope starts.
+pub fn (mut a FlatAst) reserve_transform_texts(headroom int) {
+	if headroom <= 0 {
+		return
+	}
+	unsafe { a.text_values.grow_cap(headroom) }
+	a.text_ids.reserve(u32(a.text_ids.len + headroom))
+}
+
+// promote_transform_texts_from moves canonical strings inserted by a scoped
+// transform into the current arena and rebuilds table backing only if it grew
+// into the disposable scope.
+pub fn (mut a FlatAst) promote_transform_texts_from(start int, scope voidptr) {
+	// Scratch storage may have been allocated in the disposable scope.
+	a.recent_text_ids = []TextId{}
+	first := if start < 0 { 0 } else { start }
+	mut rebuild := scoped_text_storage_owned(scope, a.text_values.data)
+	$if prealloc {
+		// Any string interned inside the disposable scope may have placed its
+		// bytes — or grown the lookup map's internal backing — into that scope.
+		// There is no supported API to inspect a `map`'s backing pointers, so
+		// rather than mirror the private builtin.map/DenseArray ABI we rebuild
+		// the whole text table into the current arena whenever the scope interned
+		// anything. This is a superset of the cases where storage was actually
+		// scoped, so it is always safe.
+		if a.text_values.len > first {
+			rebuild = true
+		}
+	}
+	if rebuild {
+		mut values, mut ids := a.clone_text_table_owned()
+		a.text_values = values
+		a.text_ids = ids.move()
+	}
+}
+
+fn scoped_text_storage_owned(scope voidptr, ptr voidptr) bool {
+	$if prealloc {
+		return unsafe { prealloc_scope_owns(scope, ptr) }
+	}
+	return false
+}
+
+// clone_text_table_owned copies the canonical text table and rebuilds its
+// lookup map with storage owned by the current allocation arena.
+pub fn (a &FlatAst) clone_text_table_owned() ([]string, map[string]TextId) {
+	mut values := []string{cap: a.text_values.len}
+	mut ids := map[string]TextId{}
+	ids.reserve(u32(a.text_values.len))
+	for value in a.text_values {
+		canonical := value.clone()
+		values << canonical
+		ids[canonical] = TextId(values.len)
+	}
+	return values, ids
+}
+
+// text resolves a stable AST text identity.
+@[direct_array_access]
+pub fn (a &FlatAst) text(id TextId) string {
+	idx := int(id) - 1
+	if idx < 0 || idx >= a.text_values.len {
+		return ''
+	}
+	return a.text_values[idx]
+}
+
+// text_count returns the number of unique non-empty AST text values.
+pub fn (a &FlatAst) text_count() int {
+	return a.text_values.len
+}
+
+// type_text_id returns value's stable source-spelling identity, or zero for empty text.
+// Type annotations no longer share the AST's ordinary string-payload namespace.
+pub fn (a &FlatAst) type_text_id(value string) u32 {
+	return source_type_id(value)
+}
+
+// node_type_text_id retains a matching source-spelling identity or indexes a new spelling.
+@[inline]
+pub fn (a &FlatAst) node_type_text_id(value string, current u32) u32 {
+	if current != 0 && source_type_name(current) == value {
+		return current
+	}
+	return source_type_id(value)
+}
+
+// intern_node_texts_from canonicalizes managed payloads in nodes[start..].
+// This runs serially after parse/transform worker merges, so the text table
+// itself requires no synchronization and cannot retain worker-arena storage.
+pub fn (mut a FlatAst) intern_node_texts_from(start int) {
+	a.intern_node_texts_range(start, a.nodes.len)
+}
+
+// TextProbeCache holds per-pass scratch. Its strings borrow canonical text
+// owned by the AST; the cache itself never escapes the passes it serves.
+pub struct TextProbeCache {
+pub mut:
+	ptrs   [4096]voidptr
+	values [4096]string
+	ids    [4096]u16
+}
+
+// new_text_probe_cache returns an empty probe cache. A local `TextProbeCache{}`
+// passed on by reference is allocated as well, after it is zeroed whole and
+// copied: this allocates it alone and clears no more than a pass reads.
+pub fn new_text_probe_cache() &TextProbeCache {
+	mut cache := unsafe { &TextProbeCache(malloc_noscan(int(sizeof(TextProbeCache)))) }
+	cache.reset()
+	return cache
+}
+
+// reset empties the cache for another pass. A probe reads a value or an id
+// only after its nonzero pointer key matches, so the keys alone are cleared;
+// the cached strings already belong to the text table.
+pub fn (mut c TextProbeCache) reset() {
+	unsafe { vmemset(&c.ptrs[0], 0, int(sizeof(voidptr)) * c.ptrs.len) }
+}
+
+// intern_node_texts_range canonicalizes managed payloads in nodes[start..end).
+// The bounded form serves the parallel parse merge, where later chunks are
+// already present in the node array but must be interned in chunk order.
+pub fn (mut a FlatAst) intern_node_texts_range(start int, end int) {
+	if start >= end {
+		return
+	}
+	if end - start >= wide_text_probe_min_nodes {
+		a.intern_node_texts_range_wide(start, end)
+		return
+	}
+	mut value_cache := new_text_probe_cache()
+	mut type_cache := new_text_probe_cache()
+	a.intern_node_texts_range_cached(start, end, mut value_cache, mut type_cache)
+}
+
+// wide_text_probe_slots is the size of the pointer probe of a pass over a whole
+// tree. Such a pass meets tens of thousands of distinct texts, which overwrite
+// the 4096 slots of a TextProbeCache many times over, and every probe that
+// misses hashes the text for the table. It must be a power of two.
+const wide_text_probe_slots = 65536
+
+// wide_text_probe_min_nodes is the range from which the wide probe pays for
+// clearing its keys.
+const wide_text_probe_min_nodes = 65536
+
+// WideTextProbe is the scratch of intern_node_texts_range_wide.
+// It canonicalizes ordinary node and declaration payloads; type IDs are already owned.
+struct WideTextProbe {
+mut:
+	ptrs &voidptr = unsafe { nil }
+	vals &string  = unsafe { nil }
+}
+
+// intern_node_texts_range_wide is intern_node_texts_range_cached for a range that
+// covers most of a tree, with the probe widened to wide_text_probe_slots slots.
+@[direct_array_access]
+fn (mut a FlatAst) intern_node_texts_range_wide(start int, end int) {
+	first := if start < 0 { 0 } else { start }
+	if first >= end {
+		return
+	}
+	// A slot's text and identity are read only once its nonzero pointer key
+	// matches, so the keys alone start out cleared.
+	mut probe := WideTextProbe{
+		ptrs: unsafe { &voidptr(vcalloc_noscan(int(wide_text_probe_slots) * int(sizeof(voidptr)))) }
+		vals: unsafe { &string(malloc_noscan(int(wide_text_probe_slots) * int(sizeof(string)))) }
+	}
+	defer {
+		// These buffers borrow the AST's canonical text; release only the scratch storage.
+		unsafe {
+			free(probe.ptrs)
+			free(probe.vals)
+		}
+	}
+	for idx in first .. end {
+		// Interning grows the text tables, never the node array, so this slot stays valid.
+		mut node := &a.nodes[idx]
+		node.canonicalize_source_value()
+		node.value = a.intern_text_ptr_probed(node.value, mut probe)
+		if node.payload == 0 {
+			continue
+		}
+		payload := node.payload_ptr()
+		params := payload.generic_params
+		if params.len > 0 || payload.enum_backing_type != 0 || payload.debugger_value_types.ids.len > 0 || payload.call_type_args.ids.len > 0 || payload.fn_value_type != 0 || payload.generated_variant_type != 0 || payload.mut_optional_arg_view_type != 0 {
+			// Always rebuild the payload, as intern_node_texts_one does.
+			mut canonical_params := []string{cap: params.len}
+			for item in params {
+				canonical := a.intern_text_ptr_probed(item, mut probe)
+				canonical_params << canonical
+			}
+			node.payload = node_payload_with_types(canonical_params, payload.generic_constraints.clone(), payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), payload.fn_value_type, payload.generated_variant_type, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+		}
+	}
+}
+
+// intern_text_ptr_probed canonicalizes `value` through the wide payload probe.
+@[inline]
+fn (mut a FlatAst) intern_text_ptr_probed(value string, mut probe WideTextProbe) string {
+	if value.len == 0 {
+		return ''
+	}
+	slot := int((u64(voidptr(value.str)) >> 4) & u64(wide_text_probe_slots - 1))
+	unsafe {
+		if probe.ptrs[slot] == voidptr(value.str) && probe.vals[slot].len == value.len {
+			return probe.vals[slot]
+		}
+		_, canonical := a.intern_text(value)
+		probe.ptrs[slot] = voidptr(value.str)
+		probe.vals[slot] = canonical
+		return canonical
+	}
+}
+
+// intern_node_texts_range_cached is intern_node_texts_range with the probe
+// caches of the caller, which it empties first. A parser canonicalizes each
+// file as it completes it, and a fresh pair of caches for every file cost
+// more than the table lookups they save in a small one.
+pub fn (mut a FlatAst) intern_node_texts_range_cached(start int, end int, mut value_cache TextProbeCache, mut type_cache TextProbeCache) {
+	first := if start < 0 { 0 } else { start }
+	if first >= end {
+		return
+	}
+	// Node texts repeat heavily by exact string instance (already-interned
+	// strings share `.str`), so a direct-mapped pointer probe skips the
+	// content-hash table lookup for the overwhelming majority of nodes.
+	// Nothing is freed during this pass, so pointer keys stay valid.
+	value_cache.reset()
+	type_cache.reset()
+	for idx in first .. end {
+		a.intern_node_texts_one(idx, mut value_cache.ptrs, mut value_cache.values, mut type_cache.ptrs, mut type_cache.values, mut type_cache.ids)
+	}
+}
+
+// intern_node_texts_at canonicalizes only the listed node indexes (in list
+// order). The parallel parse merge pre-rebinds table hits on the copy threads
+// and records the remaining nodes here, so canonical-table insertion order
+// still matches the serial merge exactly.
+pub fn (mut a FlatAst) intern_node_texts_at(indexes []int) {
+	if indexes.len == 0 {
+		return
+	}
+	mut value_cache := new_text_probe_cache()
+	mut type_cache := new_text_probe_cache()
+	for idx in indexes {
+		a.intern_node_texts_one(idx, mut value_cache.ptrs, mut value_cache.values, mut type_cache.ptrs, mut type_cache.values, mut type_cache.ids)
+	}
+}
+
+// The callers index live nodes (a parsed range, or recorded merge misses), so
+// the slot needs no bounds check; the param loop is indexed for the same reason.
+@[direct_array_access]
+fn (mut a FlatAst) intern_node_texts_one(idx int, mut cache_ptrs [4096]voidptr, mut cache_vals [4096]string, mut type_cache_ptrs [4096]voidptr, mut type_cache_vals [4096]string, mut type_cache_ids [4096]u16) {
+	// Interning grows the text tables, never the node array, so this slot stays valid.
+	mut node := &a.nodes[idx]
+	node.canonicalize_source_value()
+	node.value = a.intern_text_ptr_cached(node.value, mut cache_ptrs, mut cache_vals)
+	if node.payload == 0 {
+		return
+	}
+	payload := node.payload_ptr()
+	params := payload.generic_params
+	if params.len > 0 || payload.enum_backing_type != 0 || payload.debugger_value_types.ids.len > 0 || payload.call_type_args.ids.len > 0 || payload.fn_value_type != 0 || payload.generated_variant_type != 0 || payload.mut_optional_arg_view_type != 0 {
+		// Always rebuild the payload: the params array itself may live in a
+		// stage arena even when every param string is already canonical.
+		mut canonical_params := []string{cap: params.len}
+		for index in 0 .. params.len {
+			canonical_params << a.intern_text_ptr_cached(params[index], mut cache_ptrs, mut cache_vals)
+		}
+		node.payload = node_payload_with_types(canonical_params, payload.generic_constraints.clone(), payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), payload.fn_value_type, payload.generated_variant_type, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+	}
+}
+
+// intern_type_text_ptr_cached canonicalizes a node type spelling and returns
+// its compact identity. Programs with more than 65535 texts use 0 and retain
+// the existing string-keyed fallback.
+@[direct_array_access]
+pub fn (mut a FlatAst) intern_type_text_ptr_cached(value string, mut cache_ptrs [4096]voidptr, mut cache_vals [4096]string, mut cache_ids [4096]u16) (u16, string) {
+	if value.len == 0 {
+		return 0, ''
+	}
+	slot := int((u64(voidptr(value.str)) >> 4) & 4095)
+	if cache_ptrs[slot] == voidptr(value.str) && cache_vals[slot].len == value.len {
+		return cache_ids[slot], cache_vals[slot]
+	}
+	id, canonical := a.intern_text(value)
+	compact_id := if id <= 65535 { u16(id) } else { u16(0) }
+	cache_ptrs[slot] = voidptr(value.str)
+	cache_vals[slot] = canonical
+	cache_ids[slot] = compact_id
+	return compact_id, canonical
+}
+
+// probe_text_ptr_cached is the read-only twin of intern_text_ptr_cached: it
+// rebinds `value` to its canonical copy when the text table already holds the
+// content and reports a miss otherwise, never mutating the table. Safe on
+// worker threads only while no thread inserts into the table.
+pub fn (a &FlatAst) probe_text_ptr_cached(value string, mut cache_ptrs [4096]voidptr, mut cache_vals [4096]string) (string, bool) {
+	if value.len == 0 {
+		return '', true
+	}
+	slot := int((u64(voidptr(value.str)) >> 4) & 4095)
+	if cache_ptrs[slot] == voidptr(value.str) && cache_vals[slot].len == value.len {
+		return cache_vals[slot], true
+	}
+	if id := a.text_ids[value] {
+		canonical := a.text_values[int(id) - 1]
+		cache_ptrs[slot] = voidptr(value.str)
+		cache_vals[slot] = canonical
+		return canonical, true
+	}
+	return value, false
+}
+
+// probe_type_text_ptr_cached is the compact-id form used while parallel parse
+// workers probe the frozen master text table.
+pub fn (a &FlatAst) probe_type_text_ptr_cached(value string, mut cache_ptrs [4096]voidptr, mut cache_vals [4096]string, mut cache_ids [4096]u16) (u16, string, bool) {
+	if value.len == 0 {
+		return 0, '', true
+	}
+	slot := int((u64(voidptr(value.str)) >> 4) & 4095)
+	if cache_ptrs[slot] == voidptr(value.str) && cache_vals[slot].len == value.len {
+		return cache_ids[slot], cache_vals[slot], true
+	}
+	if id := a.text_ids[value] {
+		canonical := a.text_values[int(id) - 1]
+		compact_id := if id <= 65535 { u16(id) } else { u16(0) }
+		cache_ptrs[slot] = voidptr(value.str)
+		cache_vals[slot] = canonical
+		cache_ids[slot] = compact_id
+		return compact_id, canonical, true
+	}
+	return 0, value, false
+}
+
+// intern_text_ptr_cached interns text using a caller-owned scratch cache.
+@[direct_array_access]
+pub fn (mut a FlatAst) intern_text_ptr_cached(value string, mut cache_ptrs [4096]voidptr, mut cache_vals [4096]string) string {
+	if value.len == 0 {
+		return ''
+	}
+	slot := int((u64(voidptr(value.str)) >> 4) & 4095)
+	// The length check guards against distinct strings sharing one base pointer
+	// (unsafe zero-copy slices); same pointer + same length means same content.
+	if cache_ptrs[slot] == voidptr(value.str) && cache_vals[slot].len == value.len {
+		return cache_vals[slot]
+	}
+	_, canonical := a.intern_text(value)
+	cache_ptrs[slot] = voidptr(value.str)
+	cache_vals[slot] = canonical
+	return canonical
+}
+
+// intern_metadata_texts canonicalizes all source-derived FlatAst map keys and
+// values. Once this and intern_node_texts_from have run, source buffers are no
+// longer part of the AST representation and can be released.
+pub fn (mut a FlatAst) intern_metadata_texts() {
+	mut disabled_fns := map[string]bool{}
+	for name, disabled in a.disabled_fns {
+		_, canonical := a.intern_text(name)
+		disabled_fns[canonical] = disabled
+	}
+	a.disabled_fns = disabled_fns.move()
+	mut export_fn_names := map[string]string{}
+	for name, value in a.export_fn_names {
+		_, canonical_name := a.intern_text(name)
+		_, canonical_value := a.intern_text(value)
+		export_fn_names[canonical_name] = canonical_value
+	}
+	a.export_fn_names = export_fn_names.move()
+	mut noreturn_fns := map[string]bool{}
+	for name, is_noreturn in a.noreturn_fns {
+		_, canonical := a.intern_text(name)
+		noreturn_fns[canonical] = is_noreturn
+	}
+	a.noreturn_fns = noreturn_fns.move()
+}
+
+// source_position resolves an AST source position to the file/line/column that it
+// reports, following `#line` directives in the source (see File.logical_position_at).
+pub fn (a &FlatAst) source_position(pos token.Pos) ?token.Position {
+	if !pos.is_valid() {
+		return none
+	}
+	file := a.source_files[pos.id] or { return none }
+	if pos.offset < 0 || pos.offset > file.size {
+		return none
+	}
+	return file.logical_position_at(pos.offset)
+}
+
+// add updates add state for FlatAst.
+pub fn (mut a FlatAst) add(kind NodeKind) NodeId {
+	id := NodeId(a.nodes.len)
+	a.nodes << Node{
+		kind: kind
+	}
+	return id
+}
+
+// add_id updates add id state for FlatAst.
+pub fn (mut a FlatAst) add_id(kind_id int) NodeId {
+	id := NodeId(a.nodes.len)
+	a.nodes << Node{
+		kind: node_kind_from_id(kind_id)
+	}
+	return id
+}
+
+// node_kind_from_id converts node kind from id data for flat.
+@[inline]
+pub fn node_kind_from_id(id int) NodeKind {
+	return unsafe { NodeKind(id) }
+}
+
+// add_val updates add val state for FlatAst.
+pub fn (mut a FlatAst) add_val(kind NodeKind, value string) NodeId {
+	id := NodeId(a.nodes.len)
+	mut node := Node{
+		kind:  kind
+		value: value
+	}
+	node.canonicalize_source_value()
+	a.nodes << node
+	return id
+}
+
+// add_val_id updates add val id state for FlatAst.
+pub fn (mut a FlatAst) add_val_id(kind_id int, value string) NodeId {
+	id := NodeId(a.nodes.len)
+	mut node := Node{
+		kind:  node_kind_from_id(kind_id)
+		value: value
+	}
+	node.canonicalize_source_value()
+	a.nodes << node
+	return id
+}
+
+// with_shifted_children returns a copy of the node whose children_start is moved
+// by `shift`. children_start lives in the immutable section of Node, so callers
+// that relocate a node's children block (e.g. the parallel-transform merge) build
+// a fresh node instead of mutating in place.
+pub fn (n Node) with_shifted_children(shift i32) Node {
+	return Node{
+		value:          n.value
+		source_value:   n.source_value
+		typ:            n.typ
+		payload:        n.payload
+		pos:            n.pos
+		children_start: n.children_start + shift
+		children_count: n.children_count
+		kind:           n.kind
+		op:             n.op
+		is_mut:         n.is_mut
+		flags:          n.flags
+	}
+}
+
+// with_pos returns a copy of the node with source position `pos`.
+pub fn (n Node) with_pos(pos token.Pos) Node {
+	return Node{
+		value:          n.value
+		source_value:   n.source_value
+		typ:            n.typ
+		payload:        n.payload
+		pos:            pos
+		children_start: n.children_start
+		children_count: n.children_count
+		kind:           n.kind
+		op:             n.op
+		is_mut:         n.is_mut
+		flags:          n.flags
+	}
+}
+
+// clone_owned returns a deep copy whose managed text and payload survive scoped arenas.
+pub fn (n Node) clone_owned() Node {
+	payload := n.payload_metadata()
+	mut params := []string{cap: n.generic_params().len}
+	for param in n.generic_params() {
+		params << param.clone()
+	}
+	return Node{
+		value:          n.value.clone()
+		source_value:   n.source_value
+		typ:            n.typ
+		payload:        if n.payload == canonical_comptime_type_payload {
+			canonical_comptime_type_payload
+		} else {
+			node_payload_with_types(params, payload.generic_constraints.clone(), payload.enum_backing_type, payload.debugger_value_types.clone(), payload.call_type_args.clone(), payload.fn_value_type, payload.generated_variant_type, payload.mut_optional_arg_view_type, payload.attribute_kinds)
+		}
+		pos:            n.pos
+		children_start: n.children_start
+		children_count: n.children_count
+		kind:           n.kind
+		op:             n.op
+		is_mut:         n.is_mut
+		flags:          n.flags
+	}
+}
+
+// add_node updates add node state for FlatAst.
+pub fn (mut a FlatAst) add_node(node Node) NodeId {
+	if node.value.len > 0 && (node.source_value != 0 || node.has_source_value_kind()) {
+		return a.add_canonicalized_node(node)
+	}
+	id := NodeId(a.nodes.len)
+	if a.nodes.len < a.nodes.cap {
+		unsafe {
+			mut slot := &Node(&u8(a.nodes.data) + uint(a.nodes.len) * sizeof(Node))
+			*slot = node
+			a.nodes.len++
+		}
+		return id
+	}
+	a.nodes << node
+	return id
+}
+
+// add_canonicalized_node keeps the legacy operand copy off the immutable append path.
+@[noinline]
+fn (mut a FlatAst) add_canonicalized_node(node Node) NodeId {
+	mut canonical := node
+	canonical.canonicalize_source_value()
+	// Canonicalization clears value, so this enters the immutable append path once.
+	return a.add_node(canonical)
+}
+
+// child_count converts a dynamic child count to Node's compact storage type.
+pub fn child_count(count int) i32 {
+	if count < 0 {
+		panic('flat node cannot have a negative child count')
+	}
+	return i32(count)
+}
+
+// begin_children supports begin children handling for FlatAst.
+pub fn (mut a FlatAst) begin_children() int {
+	return a.children.len
+}
+
+// add_child updates add child state for FlatAst.
+pub fn (mut a FlatAst) add_child(id NodeId) {
+	if a.children.len < a.children.cap {
+		unsafe {
+			mut slot := &NodeId(&u8(a.children.data) + uint(a.children.len) * sizeof(NodeId))
+			*slot = id
+			a.children.len++
+		}
+		return
+	}
+	a.children << id
+}
+
+// child supports child handling for FlatAst.
+// Array lengths are never negative, so one unsigned comparison rejects both a
+// negative index and one at or past the end.
+@[direct_array_access; inline]
+pub fn (a &FlatAst) child(node &Node, index int) NodeId {
+	child_index := node.children_start + index
+	if u64(index) >= u64(node.children_count) || u64(child_index) >= u64(a.children.len) {
+		return empty_node
+	}
+	// Bounds are checked above; avoid a second array bounds check on this hot path.
+	return unsafe { a.children[child_index] }
+}
+
+// child_node supports child node handling for FlatAst.
+@[direct_array_access; inline]
+pub fn (a &FlatAst) child_node(node &Node, index int) &Node {
+	id := a.child(node, index)
+	if u64(int(id)) >= u64(a.nodes.len) {
+		return &empty_node_value
+	}
+	// Bounds are checked above; avoid a second array bounds check on this hot path.
+	return unsafe { &a.nodes[int(id)] }
+}
+
+// node supports node handling for FlatAst.
+@[direct_array_access; inline]
+pub fn (a &FlatAst) node(id NodeId) &Node {
+	if u64(int(id)) >= u64(a.nodes.len) {
+		return &empty_node_value
+	}
+	// Bounds are checked above; avoid a second array bounds check on this hot path.
+	return unsafe { &a.nodes[int(id)] }
+}
+
+// children_of supports children of handling for FlatAst.
+pub fn (a &FlatAst) children_of(node &Node) []NodeId {
+	if node.children_count == 0 {
+		return []
+	}
+	if node.children_start < 0 || node.children_start >= a.children.len {
+		return []
+	}
+	if node.children_start + node.children_count > a.children.len {
+		return a.children[node.children_start..]
+	}
+	return a.children[node.children_start..node.children_start + node.children_count]
+}
+
+// print_tree updates print tree state for FlatAst.
+pub fn (a &FlatAst) print_tree(id NodeId, indent int) {
+	node := a.nodes[int(id)]
+	mut prefix := ''
+	for _ in 0 .. indent {
+		prefix += '  '
+	}
+	mut info := '${node.kind}'
+	if node.value_text().len > 0 {
+		info += ' "${node.value_text()}"'
+	}
+	if node.op != .none {
+		info += ' op=${node.op}'
+	}
+	if node.typ_text().len > 0 {
+		info += ' typ=${node.typ_text()}'
+	}
+	println('${prefix}${info}')
+	for i in 0 .. node.children_count {
+		child_id := a.children[node.children_start + i]
+		if int(child_id) >= 0 {
+			a.print_tree(child_id, indent + 1)
+		}
+	}
+}

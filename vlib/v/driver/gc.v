@@ -1,0 +1,101 @@
+module driver
+
+import os
+import v.pref
+
+const v3_default_gc_mode = 'boehm_full_opt'
+
+fn v3_gc_mode_defines(gc_mode string, disable_gc bool) ![]string {
+	mode := if gc_mode in ['', 'boehm'] { v3_default_gc_mode } else { gc_mode }
+	defines := match mode {
+		'none' { []string{} }
+		'boehm_full' { ['gcboehm', 'gcboehm_full'] }
+		'boehm_incr' { ['gcboehm', 'gcboehm_incr'] }
+		'boehm_full_opt' { ['gcboehm', 'gcboehm_full', 'gcboehm_opt'] }
+		'boehm_incr_opt' { ['gcboehm', 'gcboehm_incr', 'gcboehm_opt'] }
+		'boehm_leak' { ['gcboehm', 'gcboehm_leak'] }
+		'vgc' { ['vgc'] }
+		else {
+			return error('unknown garbage collection mode `-gc ${gc_mode}`; supported modes are: boehm, boehm_full, boehm_incr, boehm_full_opt, boehm_incr_opt, boehm_leak, none, vgc')
+		}
+	}
+	if disable_gc {
+		return []string{}
+	}
+	return defines
+}
+
+// v3_gc_is_disabled reports whether the collector of `gc_mode` must be left out of
+// the build.
+// A build for another OS or architecture has no Boehm collector: the bundled
+// libgc and its headers are the host's, and the target's toolchain may have
+// none. vgc stays in: it is V code and one header (thirdparty/vgc), which picks
+// the target's system calls itself, so it builds for any target that it supports
+// natively.
+// The x64 backend is in that group for its own reason: it allocates through
+// libc, so no collector is ever compiled in. The arm64 backend does the same by
+// default; an explicit Boehm `-gc` mode links the prebuilt collector with the
+// system linker on macOS.
+fn v3_gc_is_disabled(building_v bool, cross_output bool, target_os string, target_arch string, backend string, gc_mode string) bool {
+	if building_v || cross_output {
+		return true
+	}
+	if backend in ['amd64', 'x64'] {
+		return true
+	}
+	if backend == 'arm64' {
+		// arm64 links the collector through the system linker (see
+		// arm64_link_mode), only on macOS and only when asked for explicitly:
+		// the default stays the libc allocator and the built-in linker.
+		if !gc_mode.starts_with('boehm') || pref.normalized_os(target_os.trim_space().to_lower()) != 'macos' {
+			return true
+		}
+	}
+	if gc_mode == 'vgc' {
+		return false
+	}
+	host := pref.host_target()
+	return pref.normalized_os(target_os.trim_space().to_lower()) != host.os
+		|| pref.normalized_arch(target_arch.trim_space().to_lower()) != host.arch
+}
+
+fn apply_v3_gc_mode(gc_mode string, disable_gc bool, mut user_defines []string, mut compile_values map[string]string) ! {
+	for define in v3_gc_mode_defines(gc_mode, disable_gc)! {
+		record_user_define(mut user_defines, mut compile_values, define)
+	}
+	if v3_gc_prefers_platform_cc(user_defines) {
+		// The prebuilt archives already enable thread-local allocation. Omitting
+		// THREAD_LOCAL_ALLOC only affects a collector compiled from source.
+		record_user_define(mut user_defines, mut compile_values, 'use_bundled_libgc')
+	}
+}
+
+fn v3_gc_prefers_platform_cc(user_defines []string) bool {
+	return 'gcboehm' in user_defines && 'no_gc_thread_local_alloc' in user_defines
+		&& 'dynamic_boehm' !in user_defines
+}
+
+fn v3_missing_bundled_gc_library(flags []string, vroot string) ?string {
+	lexical_root := os.norm_path(os.abs_path(os.join_path(vroot, 'thirdparty', 'tcc', 'lib')))
+	root := os.real_path(os.join_path(os.real_path(vroot), 'thirdparty', 'tcc', 'lib'))
+	for index in c_link_input_indices(flags) {
+		path := flags[index]
+		canonical := os.join_path(os.real_path(os.dir(path)), os.file_name(path))
+		lexical := os.norm_path(os.abs_path(path))
+		if (canonical in [os.join_path(root, 'libgc.a'), os.join_path(root, 'libgc.dylib')]
+			|| lexical in [os.join_path(lexical_root, 'libgc.a'),
+				os.join_path(lexical_root, 'libgc.dylib')])
+			&& !os.is_file(path) {
+			return path
+		}
+	}
+	return none
+}
+
+fn v3_missing_gc_library_message(path string) string {
+	return 'builder error:
+==================
+Boehm GC library `${path}` was not found.
+Reinstall V to restore its bundled libraries, or pass `-d use_bundled_libgc` to build GC from source.
+To compile without garbage collection, pass `-gc none`.'
+}

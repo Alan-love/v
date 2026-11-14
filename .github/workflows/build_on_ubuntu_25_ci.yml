@@ -1,0 +1,55 @@
+name: CI Ubuntu 25 GCC 14.2
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ubuntu-25-build_on_ubuntu_25_ci-${{ github.ref == 'refs/heads/master' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-25-gcc-14-2-build:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build and test in Ubuntu 25.04 with GCC 14.2
+        run: |
+          set -euxo pipefail
+          echo "$PWD"
+          whoami
+          touch outside_docker.txt
+          git log -n4
+          echo "running docker ..."
+          docker run --rm \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,destination=/src,readonly" \
+            --mount type=bind,source=/etc/ssl/certs/ca-certificates.crt,destination=/tmp/runner-ca-certificates.crt,readonly \
+            -w /src ubuntu:25.04 bash -euxo pipefail -c '
+            echo "running inside docker"
+            whoami
+            cp -r /src ~/vproject
+            cd ~/vproject
+            touch inside_docker.txt
+            ls -la
+            # The minimal image has no CA bundle until ca-certificates is installed.
+            # Use the runner trust store to bootstrap HTTPS package downloads.
+            bash .github/workflows/disable_azure_mirror.sh
+            apt_options=(-o Acquire::https::CaInfo=/tmp/runner-ca-certificates.crt -o Acquire::Retries=3 -o Acquire::https::Timeout=30)
+            apt-get "${apt_options[@]}" update --error-on=any
+            apt-get "${apt_options[@]}" install -y --no-install-recommends ca-certificates git build-essential
+            git log -n4
+            git config --global --add safe.directory "$PWD/vc"
+            git config --global --add safe.directory "$PWD/thirdparty/tcc"
+            make
+            VFLAGS= ./v self -prod -cc gcc -parallel-cc
+            ./v symlink
+            v run examples/hello_world.v
+            v run examples/primes.v
+          '

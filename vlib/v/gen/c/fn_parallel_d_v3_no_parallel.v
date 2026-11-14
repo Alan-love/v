@@ -1,0 +1,109 @@
+module c
+
+import v.flat
+import time
+
+fn (g &FlatGen) parallel_codegen_available() bool {
+	return false
+}
+
+fn (mut g FlatGen) refine_fn_item_costs(_ bool, _ bool) {}
+
+fn par_cgen_prep_enabled() bool {
+	return false
+}
+
+fn (mut g FlatGen) scan_collect_gen_info(_ bool) CollectGenInfoScanCounts {
+	return g.scan_collect_gen_info_serial()
+}
+
+// sorted_fn_gen_item_keys sorts the keys by C name, stably.
+fn (g &FlatGen) sorted_fn_gen_item_keys(keys []FlatFnGenItemSortKey) []FlatFnGenItemSortKey {
+	mut sorted := keys.clone()
+	sorted.sort(a.c_name < b.c_name)
+	return sorted
+}
+
+// TypeIndexArgs is empty: v3_no_parallel builds share no type indexes.
+struct TypeIndexArgs {}
+
+fn (mut g FlatGen) start_type_indexes(_ bool) (&TypeIndexArgs, []int) {
+	return &TypeIndexArgs{}, []int{}
+}
+
+fn (mut g FlatGen) finish_type_indexes(_ &TypeIndexArgs, _ []int) {}
+
+fn (mut g FlatGen) start_embedded_fields_lane(_ bool) {}
+
+fn (mut g FlatGen) finish_embedded_fields_lane() bool {
+	return false
+}
+
+fn (mut g FlatGen) apply_fn_signature_registrations(registration_lists [][]FnSignatureRegistration, node_regs []FnDeclNodeReg) {
+	for group in 0 .. fn_signature_registration_groups {
+		g.apply_fn_signature_registration_groups(registration_lists, group)
+	}
+	for which in 0 .. 3 {
+		g.register_fn_decl_nodes(node_regs, which)
+	}
+}
+
+fn (mut g FlatGen) prepare_shared_sum_and_fixed_array_ret_wrappers(_ bool) bool {
+	mut sw := time.new_stopwatch()
+	g.collect_shared_type_names()
+	g.precompute_sum_name_lookup()
+	if !g.skip_generics {
+		g.precompute_generic_method_candidate_index()
+	}
+	g.timing_profile('  [ttime]     wr shared+sum  ${f64(sw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	sw.restart()
+	g.populate_fixed_array_ret_wrappers()
+	g.timing_profile('  [ttime]     wr fixed ret   ${f64(sw.elapsed().microseconds()) / 1000.0:7.2f} ms')
+	return false
+}
+
+fn (mut g FlatGen) collect_gen_info_fn_preps(_ []i32, _ bool, _ bool) CollectGenFnPreps {
+	return CollectGenFnPreps{}
+}
+
+fn (mut g FlatGen) collect_fn_gen_candidates_parallel(direct_array_access_fns DirectArrayAccessFns, ignore_overflow_fns DirectArrayAccessFns, program_modules map[string]bool) []FlatFnGenCandidate {
+	nodes := g.top_level_nodes()
+	return g.collect_fn_gen_candidates_range(nodes, 0, nodes.len, '', '', direct_array_access_fns,
+		ignore_overflow_fns, program_modules)
+}
+
+// gen_fns_dispatch emits all functions serially when v3 is built with the
+// internal `v3_no_parallel` define.
+fn (mut g FlatGen) gen_fns_dispatch(_ bool) {
+	g.gen_test_failure_global()
+	g.gen_fns()
+	g.gen_synthetic_main_after_fns()
+}
+
+// parallel_decl_task_planned is always false when parallel cgen is compiled out.
+fn (g &FlatGen) parallel_decl_task_planned() bool {
+	return false
+}
+
+// prepare_serial_fn_tables is unnecessary when parallel cgen is compiled out.
+fn (mut g FlatGen) prepare_serial_fn_tables() {}
+
+// run_pre_dispatch_parallel is serial-only in `v3_no_parallel` builds.
+fn (mut g FlatGen) run_pre_dispatch_parallel(_ bool) bool {
+	return false
+}
+
+// fn_item_cost_and_prep never pre-seeds in `v3_no_parallel` builds; it is only
+// reachable with want_parallel_prep set, which nothing sets here.
+fn (mut g FlatGen) fn_item_cost_and_prep(node_id flat.NodeId, mut _stack []flat.NodeId, mut _type_text_cache map[u32]bool) int {
+	return flat_fn_gen_item_cost(g.a, node_id)
+}
+
+fn (mut g FlatGen) fn_item_cost_and_c_extern_prep(node_id flat.NodeId, mut _stack []flat.NodeId) int {
+	return flat_fn_gen_item_cost(g.a, node_id)
+}
+
+fn (g &FlatGen) interface_boxing_candidate_nodes() []i32 {
+	ids := g.type_metadata_nodes()
+	return interface_boxing_candidates_in(g.a, ids, 0, ids.len)
+}

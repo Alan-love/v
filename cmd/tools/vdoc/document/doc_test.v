@@ -1,0 +1,305 @@
+// vtest build: tinyc && !musl? && !sanitized_job?
+import os
+import document as doc
+import v.pref
+
+// fn test_generate() {}
+// fn test_generate_from_ast() {}
+fn test_generate_with_pos_collects_variables_from_innermost_scope() {
+	mod_dir := os.join_path(os.vtmp_dir(), 'vdoc_generate_with_pos_${os.getpid()}')
+	os.rmdir_all(mod_dir) or {}
+	os.mkdir_all(mod_dir)!
+	defer {
+		os.rmdir_all(mod_dir) or {}
+	}
+	source := 'module scope_test
+
+fn inspect(argument string) {
+	outer := 1
+	if true {
+		nested := "inside"
+		_ = nested // nested cursor
+	}
+	_ = outer // function cursor
+}
+'
+	file_path := os.join_path(mod_dir, 'scope_sample.v')
+	os.write_file(file_path, source)!
+	real_file_path := os.real_path(file_path)
+
+	nested_pos := source.index('nested cursor') or { panic('missing nested cursor') }
+	nested_doc := doc.generate_with_pos(mod_dir, 'scope_sample.v', nested_pos)!
+	assert nested_doc.filename == real_file_path
+	assert nested_doc.pos == nested_pos
+	assert nested_doc.scoped_contents.keys() == ['nested']
+	assert nested_doc.scoped_contents['nested']!.kind == .variable
+	assert nested_doc.scoped_contents['nested']!.from_scope
+	assert nested_doc.scoped_contents['nested']!.return_type == 'string'
+	assert nested_doc.scoped_contents['nested']!.file_path == real_file_path
+
+	function_pos := source.index('function cursor') or { panic('missing function cursor') }
+	function_doc := doc.generate_with_pos(mod_dir, 'scope_sample.v', function_pos)!
+	mut names := function_doc.scoped_contents.keys()
+	names.sort()
+	assert names == ['argument', 'outer']
+	assert function_doc.scoped_contents['argument']!.return_type == 'string'
+	assert function_doc.scoped_contents['outer']!.return_type == 'int'
+}
+
+fn test_generate_from_mod() {
+	nested_mod_name := 'net.http.chunked'
+	nested_mod_doc := doc.generate_from_mod(nested_mod_name, false, true) or {
+		eprintln(err)
+		assert false
+		doc.Doc{}
+	}
+	assert nested_mod_doc.head.name == nested_mod_name
+	assert nested_mod_doc.head.content == 'module ${nested_mod_name}'
+	assert nested_mod_doc.contents.len == 3
+	assert nested_mod_doc.contents['ChunkScanner'].children.len == 4
+}
+
+fn test_tags_with_flag_struct_attribute() {
+	mod_name := 'gg'
+	mod_doc := doc.generate_from_mod(mod_name, false, true) or {
+		eprintln(err)
+		assert false
+		doc.Doc{}
+	}
+	assert mod_doc.head.name == mod_name
+
+	mouse_buttons := mod_doc.contents['MouseButtons']!
+	assert mouse_buttons.content == '@[flag]
+pub enum MouseButtons {
+	left
+	right
+	middle
+}'
+	assert mouse_buttons.attrs == {
+		'flag': '@[flag]'
+	}
+	assert mouse_buttons.tags == ['@[flag]']
+
+	end_options := mod_doc.contents['EndOptions']
+	assert end_options.content == '@[params]
+pub struct EndOptions {
+pub:
+	how EndEnum
+}'
+	assert end_options.attrs == {
+		'params': '@[params]'
+	}
+	assert end_options.tags == ['@[params]']
+
+	pipeline_container := mod_doc.contents['PipelineContainer']
+	assert pipeline_container.content == "@[heap]
+pub struct PipelineContainer {
+pub mut:
+	alpha    render.Pipeline
+	add      render.Pipeline
+	multiply render.Pipeline
+	screen   render.Pipeline
+	// font draws the text atlas: the same alpha blend as `alpha`, but with the
+	// font shader that reads the r8 atlas's red channel as coverage.
+	font render.Pipeline
+}"
+	assert pipeline_container.attrs == {
+		'heap': '@[heap]'
+	}
+	assert pipeline_container.tags == ['@[heap]']
+}
+
+fn test_generated_enum_helpers_are_documented() {
+	mod_doc := doc.generate_from_mod('gg', false, true) or {
+		eprintln(err)
+		assert false
+		doc.Doc{}
+	}
+
+	mouse_buttons := mod_doc.contents['MouseButtons']!
+	mouse_button_methods := mouse_buttons.children.filter(it.kind == .method)
+	assert mouse_button_methods.map(it.name) == ['is_empty', 'has', 'all', 'set', 'set_all', 'clear',
+		'clear_all', 'toggle']
+	assert mouse_button_methods.map(it.content) == [
+		'pub fn (e &MouseButtons) is_empty() bool',
+		'pub fn (e &MouseButtons) has(flag MouseButtons) bool',
+		'pub fn (e &MouseButtons) all(flag MouseButtons) bool',
+		'pub fn (mut e MouseButtons) set(flag MouseButtons)',
+		'pub fn (mut e MouseButtons) set_all()',
+		'pub fn (mut e MouseButtons) clear(flag MouseButtons)',
+		'pub fn (mut e MouseButtons) clear_all()',
+		'pub fn (mut e MouseButtons) toggle(flag MouseButtons)',
+	]
+	assert mouse_button_methods.all(it.parent_name == 'MouseButtons' && it.comments.len == 1)
+
+	mouse_buttons_from := mod_doc.contents['MouseButtons.from']!
+	assert mouse_buttons_from.kind == .method
+	assert mouse_buttons_from.content == 'pub fn MouseButtons.from[W](input W) !MouseButtons'
+	assert mouse_buttons_from.pos == mouse_buttons.pos
+
+	mouse_buttons_zero := mod_doc.contents['MouseButtons.zero']!
+	assert mouse_buttons_zero.kind == .method
+	assert mouse_buttons_zero.content == 'pub fn MouseButtons.zero() MouseButtons'
+
+	// Enums without `@[flag]` only get `from`.
+	end_enum := mod_doc.contents['EndEnum']!
+	assert end_enum.children.filter(it.kind == .method).len == 0
+	assert mod_doc.contents['EndEnum.from']!.content == 'pub fn EndEnum.from[W](input W) !EndEnum'
+	assert 'EndEnum.zero' !in mod_doc.contents
+}
+
+fn test_merge_doc_comments_keeps_blockquotes_on_separate_lines() {
+	comments := [
+		doc.DocComment{
+			text: '> **Note**\n> line one\n> line two'
+		},
+	]
+	assert doc.merge_doc_comments(comments).trim_space() == '> **Note**\n> line one\n> line two'
+}
+
+fn test_merge_doc_comments_starts_a_list_after_text_on_a_new_line() {
+	comments := [
+		doc.DocComment{
+			text: 'The fields are:\n- `a` is a\n- `b` is b\nSearch order:\n1. first\n2. second'
+		},
+	]
+	assert doc.merge_doc_comments(comments).trim_space() == 'The fields are:\n- `a` is a\n- `b` is b\nSearch order:\n1. first\n2. second'
+}
+
+fn test_the_text_around_an_example_is_kept() {
+	mod_dir := os.join_path(os.vtmp_dir(), 'vdoc_examples_text_${os.getpid()}')
+	os.rmdir_all(mod_dir) or {}
+	os.mkdir_all(mod_dir)!
+	defer { os.rmdir_all(mod_dir) or {} }
+	os.write_file(os.join_path(mod_dir, 'ex.v'), 'module ex
+
+// first describes first.
+// Example:
+// ```v
+// assert 1 == 1
+// ```
+// More text after the example.
+pub fn first() {}
+
+// second describes second.
+// Example: assert 2 == 2
+// More text after a one-line example.
+pub fn second() {}
+
+// third describes third.
+// Example:
+//   assert 3 == 3
+// More text.
+pub fn third() {}
+')!
+	mod_doc := doc.generate(mod_dir, true, true, .auto)!
+	first := mod_doc.contents['first']!
+	assert first.merge_comments_without_examples() == 'first describes first. More text after the example.'
+	assert first.examples() == ['assert 1 == 1']
+	second := mod_doc.contents['second']!
+	assert second.merge_comments_without_examples() == 'second describes second. More text after a one-line example.'
+	assert second.examples() == ['assert 2 == 2']
+	// Without a code block after it, an `Example:` line is text, like the lines after it.
+	third := mod_doc.contents['third']!
+	assert third.merge_comments_without_examples() == 'third describes third. Example: assert 3 == 3 More text.'
+	assert third.examples() == []
+}
+
+fn test_merge_doc_comments_preserves_readme_markdown() {
+	readme := '# Description
+
+`regex` is a small but powerful regular expression library,
+written in pure V.
+
+1. The basic atomic elements of this regex engine are the tokens.
+   In a query string a simple character is a token.
+
+> **Note**
+> `regex` is *not* PCRE compatible.
+'
+	comments := [
+		doc.DocComment{
+			is_readme: true
+			text:      readme
+		},
+	]
+	assert doc.merge_doc_comments(comments) == readme
+}
+
+fn test_enum_comments_after_top_level_comptime_if_are_documented() {
+	mod_dir := os.join_path(os.vtmp_dir(), 'vdoc_issue_23338_${os.getpid()}')
+	os.rmdir_all(mod_dir) or {}
+	os.mkdir_all(mod_dir)!
+	defer {
+		os.rmdir_all(mod_dir) or {}
+	}
+	os.write_file(os.join_path(mod_dir, 'issue_23338.v'), 'module issue_23338
+
+\$if macos {
+}
+
+// Foo lorem ipsum foo.
+pub enum Foo {
+	foo
+}
+
+// Bar ipsum lorem bar.
+pub enum Bar {
+	bar
+}
+')!
+	mod_doc := doc.generate(mod_dir, false, true, .auto) or {
+		eprintln(err)
+		assert false
+		doc.Doc{}
+	}
+	assert mod_doc.contents['Foo']!.merge_comments_without_examples() == 'Foo lorem ipsum foo.'
+	assert mod_doc.contents['Bar']!.merge_comments_without_examples() == 'Bar ipsum lorem bar.'
+}
+
+fn test_module_comments_after_top_level_comptime_if_stay_on_module() {
+	mod_dir := os.join_path(os.vtmp_dir(), 'vdoc_issue_23338_module_${os.getpid()}')
+	os.rmdir_all(mod_dir) or {}
+	os.mkdir_all(mod_dir)!
+	defer {
+		os.rmdir_all(mod_dir) or {}
+	}
+	os.write_file(os.join_path(mod_dir, 'issue_23338.v'), 'module issue_23338
+
+\$if macos {
+}
+
+// `issue_23338` module overview.
+
+pub fn foo() {}
+')!
+	mod_doc := doc.generate(mod_dir, false, true, .auto) or {
+		eprintln(err)
+		assert false
+		doc.Doc{}
+	}
+	assert mod_doc.head.merge_comments_without_examples() == '`issue_23338` module overview.'
+	assert mod_doc.contents['foo']!.comments.len == 0
+}
+
+fn test_generate_uses_only_sources_for_the_selected_platform() {
+	mod_dir := os.join_path(os.vtmp_dir(), 'vdoc_platform_files_${os.getpid()}')
+	os.rmdir_all(mod_dir) or {}
+	os.mkdir_all(mod_dir)!
+	defer {
+		os.rmdir_all(mod_dir) or {}
+	}
+	host_os := pref.host_os_name()
+	foreign_os := if host_os == 'windows' { 'linux' } else { 'windows' }
+	os.write_file(os.join_path(mod_dir, 'common.v'), 'module platform_files\n\npub fn common() {}\n')!
+	os.write_file(os.join_path(mod_dir, 'host_${host_os}.c.v'), 'module platform_files\n\npub fn host_specific() {}\n')!
+	os.write_file(os.join_path(mod_dir, 'foreign_${foreign_os}.c.v'), 'module platform_files\n\npub fn foreign_specific() {}\n')!
+	os.write_file(os.join_path(mod_dir, 'backend.js.v'), 'module platform_files\n\npub fn js_specific() {}\n')!
+	os.write_file(os.join_path(mod_dir, 'backend.native.v'), 'module platform_files\n\npub fn native_specific() {}\n')!
+	mod_doc := doc.generate(mod_dir, true, false, .auto)!
+	assert 'common' in mod_doc.contents
+	assert 'host_specific' in mod_doc.contents
+	assert 'foreign_specific' !in mod_doc.contents
+	assert 'js_specific' !in mod_doc.contents
+	assert 'native_specific' !in mod_doc.contents
+}

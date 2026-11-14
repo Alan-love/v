@@ -1,12 +1,13 @@
-import v.scanner
-import v.parser
-import time { now, since }
+import v.checker.tests.private_symbols
+import time { vpc_now }
 import io { ReaderWriterImpl }
 
 fn main() {
-	println(scanner.single_quote)
-	println(parser.State.html)
-	since(now())
-	_ = {'h': 2}.exists('h')
+	println(private_symbols.answer)
+	println(private_symbols.State.ready)
+	vpc_now()
+	_ = {
+		'h': 2
+	}.exists('h')
 	_ = ReaderWriterImpl{}
 }

@@ -1,0 +1,7 @@
+vlib/v/checker/tests/sumtype_define_recursively.vv:3:6: notice: unused parameter: `exprs`
+    1 | type Expr = fn ([]Expr) Expr | int
+    2 | 
+    3 | fn f(exprs []Expr) Expr {
+      |      ~~~~~
+    4 |     return 0
+    5 | }

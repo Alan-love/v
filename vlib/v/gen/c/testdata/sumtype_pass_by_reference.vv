@@ -1,0 +1,26 @@
+module main
+
+struct ParExpr {
+	expr &Expr
+}
+
+struct InfixExpr {
+	left  ?&Expr
+	right ?&Expr
+}
+
+type Expr = InfixExpr | ParExpr
+
+fn print_expr(expr &Expr) {
+	println(expr.type_name())
+}
+
+fn main() {
+	child := Expr(InfixExpr{})
+	par := ParExpr{ expr: &child }
+	parent := Expr(par)
+	print_expr(&parent)
+	print_expr(&Expr(par))
+	print_expr(par.expr)
+	print_expr(&child)
+}

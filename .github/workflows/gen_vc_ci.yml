@@ -1,0 +1,93 @@
+name: VC gen
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
+# However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
+concurrency:
+  group: gen_vc-gen_vc_ci-${{ github.ref }}
+  cancel-in-progress: ${{ !contains(github.ref, 'master')}}
+
+# Exactly one of the two jobs runs for each master event. `deploy` publishes vlang/vc from vlang/v master
+# until the vcgen.vlang.io service takes over (see doc/vcgen_service.md): setting the repository
+# variable VCGEN_SERVICE to `live` hands publishing to the service, and `validate` runs instead.
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/master' && (github.repository != 'vlang/v' || vars.VCGEN_SERVICE == 'live')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build V
+        uses: ./.github/actions/setup-v
+        with:
+          symlink: false
+      - name: Generate and check v.c and v_win.c
+        run: |
+          ./v -o gen_vc cmd/tools/gen_vc
+          ./gen_vc snapshot . vc_snapshot
+
+  deploy:
+    if: github.ref == 'refs/heads/master' && github.repository == 'vlang/v' && vars.VCGEN_SERVICE != 'live'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Push runs may wait in the Actions queue while master advances. Generate from
+      # the current tip when the job starts, so the snapshot can still be published.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: master
+      - name: Build V
+        uses: ./.github/actions/setup-v
+        with:
+          symlink: false
+      - name: Regenerate v.c and v_win.c
+        run: |
+          git config --global user.email "vlang-bot@users.noreply.github.com"
+          git config --global user.name "vlang-bot"
+
+          COMMIT_HASH="$(git rev-parse HEAD)"
+          COMMIT_MSG="$(git log -1 --oneline --pretty='%s' HEAD)"
+
+          rm -rf vc
+          ./v retry -- git clone --depth=1 "https://vlang-bot:${{ secrets.VLANG_BOT_SECRET }}@github.com/vlang/vc.git"
+
+          # Writes vc/v.c and vc/v_win.c with `#define V_COMMIT_HASH "$COMMIT_HASH"` as their
+          # first line, and runs the snapshot sanity checks (cmd/tools/gen_vc/snapshot.v).
+          ./v -o gen_vc cmd/tools/gen_vc
+          ./gen_vc snapshot . vc
+
+          git -C vc add v.c v_win.c
+          if git -C vc diff --cached --quiet; then
+            echo "vc already has the current master snapshot"
+          else
+            git -C vc commit -m "[v:master] $COMMIT_HASH - $COMMIT_MSG"
+          fi
+
+          # in case there are recent commits:
+          ./v retry -- git -C vc pull --rebase origin master
+          git -C vc log -3
+
+      - name: Deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A queued run can become stale while it is generating C. Publishing that run
+          # would rewind vc to a compiler that predates master, and the Windows CI jobs,
+          # which bootstrap from vc/v_win.c, would fail until the next run. Comparing
+          # against master's current tip also keeps publishing working after a force-push.
+          COMMIT_HASH="$(git rev-parse HEAD)"
+          latest="$(gh api "repos/${{ github.repository }}/commits/master" --jq '.sha')"
+          if [ "$COMMIT_HASH" != "$latest" ]; then
+            echo "master is now at ${latest}; the stale ${COMMIT_HASH} snapshot is not published"
+            exit 0
+          fi
+          git -C vc push

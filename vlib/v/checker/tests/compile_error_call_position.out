@@ -1,0 +1,6 @@
+vlib/v/checker/tests/compile_error_call_position.vv:10:2: error: son only taken int as input
+    8 | 
+    9 | fn main() {
+   10 |     son(false)
+      |     ~~~~~~~~~~
+   11 | }

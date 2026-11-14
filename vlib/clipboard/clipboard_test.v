@@ -1,3 +1,6 @@
+// vtest build: !linux && !freebsd
+// The tests return immediately on these platforms. Importing clipboard still
+// requires X11 development headers that minimal headless CI images may lack.
 import clipboard
 
 fn run_test(is_primary bool) {
@@ -26,4 +29,18 @@ fn test_clipboard() {
 		return
 	}
 	run_test(false)
+}
+
+fn test_multiple_clipboard_instances() {
+	$if !windows {
+		return
+	}
+	for _ in 0 .. 3 {
+		mut cb := clipboard.new()
+		assert cb.is_available() == true
+		assert cb.copy('test_multi') == true
+		assert cb.paste() == 'test_multi'
+		cb.clear_all()
+		cb.destroy()
+	}
 }
